@@ -17,7 +17,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
 
-from . import confluence
+from . import activity, confluence
 from .attachments import AttachmentMeta, read_attachment
 from .client import (
     MYSELF_PATH,
@@ -53,7 +53,8 @@ mcp: FastMCP = FastMCP(
         "Jira workflow: start with get_issue for the full ticket, then "
         "get_issue_context to find parents, subtasks, linked issues, and "
         "linked Confluence pages worth reading. Use search_issues (JQL) when "
-        "no key is given. When a ticket lists attachments relevant to the "
+        "no key is given, and get_user_activity for what someone did between "
+        "two dates. When a ticket lists attachments relevant to the "
         "task (e.g. a screenshot on a UI bug, or a log, JSON payload, or CSV "
         "export), fetch them with get_attachment to read them.\n"
         "\n"
@@ -363,6 +364,45 @@ async def search_issues(jql: str, limit: int = 25) -> str:
     """
     try:
         return await _search_issues_impl(_get_client(), jql, limit)
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def get_user_activity(
+    from_date: str,
+    to_date: str,
+    user: str = "me",
+    include_confluence: bool = False,
+    max_issues: int = 50,
+) -> str:
+    """What a user did in Jira (optionally Confluence) between two dates.
+
+    Returns Markdown grouped by issue (summary, current status), listing the
+    user's comments, status transitions, field edits and issue creations,
+    then one flat timeline. Times are in the authenticated user's timezone.
+    Notes if results were truncated or an issue failed to load.
+
+    Args:
+        from_date: First day, inclusive, "yyyy-MM-dd".
+        to_date: Day after the last day, exclusive, "yyyy-MM-dd".
+        user: "me" or an Atlassian accountId.
+        include_confluence: Also list Confluence pages the user contributed
+            to that were modified in the range.
+        max_issues: Maximum issues to inspect (1-100).
+
+    Example: get_user_activity(from_date="2026-10-30", to_date="2026-10-31")
+    for everything I did on 30 Oct 2026.
+    """
+    try:
+        return await activity.get_user_activity_impl(
+            _get_client(),
+            _get_confluence_client if include_confluence else None,
+            from_date,
+            to_date,
+            user,
+            max_issues,
+        )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 

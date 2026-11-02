@@ -31,6 +31,7 @@ transitions, deletes, or comments on anything. Enforcement is layered:
 | `get_comments(issue_key, limit=100, newest_first=False)` | Just the discussion, with author/timestamp/edited/visibility |
 | `get_issue_context(issue_key)` | Parent, subtasks, linked issues (with link direction), epic children, and remote links. Linked Confluence pages are shown with their page ID, ready for `get_confluence_page` |
 | `search_issues(jql, limit=25)` | Compact JQL search results |
+| `get_user_activity(from_date, to_date, user="me", include_confluence=False, max_issues=50)` | What a user did between two dates (`yyyy-MM-dd`, `to_date` exclusive): their comments (with mentions), status transitions, field edits and issue creations, grouped by issue and as one timeline, in the authenticated user's timezone. `user` is `"me"` or an accountId. Finds issues via `updatedBy(accountId, from, to)` JQL, then reads each issue's changelog and comments (5 in parallel). With `include_confluence`, also lists Confluence pages the user contributed to that were last modified in the range. Truncation and per-issue failures are reported in the output instead of failing the call |
 | `get_attachment(attachment_id)` | Downloads an attachment (listed by `get_issue`). Images (png/jpeg/gif/webp) come back as vision input, so Claude can look at screenshots; text files (detected by mime type, or by extension when Jira reports `application/octet-stream`) come back as text. Files of unknown type and extension (e.g. `Dockerfile`, `app.log.1`) are downloaded and served as text if their content has no NUL bytes and is valid UTF-8 (or UTF-16 with BOM). Text over 20,000 characters is saved in full (as UTF-8) under `<tmp>/jira-mcp/attachments/`, and the tool returns that path plus the first and last 50 lines, so Claude can grep or page through the file instead of loading it all. Max 5 MB; videos, PDFs, archives and other binary files are rejected |
 
 ### Confluence
@@ -190,7 +191,7 @@ Notes:
 
 Inside a Claude Code session:
 
-- Run `/mcp`; the `jira` server should be listed as connected, with eleven tools.
+- Run `/mcp`; the `jira` server should be listed as connected, with twelve tools.
 - Or just ask: *"use whoami to check the jira connection"*.
 
 ## Troubleshooting
