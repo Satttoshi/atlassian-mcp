@@ -475,3 +475,68 @@ async def test_non_image_attachment_is_rejected_without_download() -> None:
     with pytest.raises(ValueError, match="cannot be analysed visually"):
         await confluence.get_attachment_impl(client, "att555")
     assert not any("download" in path for path in router.paths())
+
+
+def media_para(file_id: str) -> dict[str, Any]:
+    return {
+        "type": "mediaSingle",
+        "content": [{"type": "media", "attrs": {"id": file_id, "type": "file"}}],
+    }
+
+
+def comment_image_routes(attachment_status: int = 200) -> dict[str, Route]:
+    with_image = comment("c1", "u1", "see screenshot")
+    with_image["body"] = adf(para("see screenshot"), media_para("file-in-comment"))
+    reply = comment("c2", "u1", "and this one")
+    reply["body"] = adf(media_para("file-in-reply"))
+    attachments: Route = (
+        httpx.Response(attachment_status)
+        if attachment_status != 200
+        else {
+            "results": [
+                {
+                    "id": "att901",
+                    "title": "bug.png",
+                    "extensions": {"fileId": "file-in-comment"},
+                }
+            ]
+        }
+    )
+    return {
+        f"{V2}/pages/100": PAGE,
+        f"{V2}/pages/100/footer-comments": {"results": [with_image]},
+        f"{V2}/pages/100/inline-comments": {"results": []},
+        f"{V2}/footer-comments/c1/children": {"results": [reply]},
+        f"{V2}/footer-comments/c2/children": {"results": []},
+        "/wiki/rest/api/content/c1/child/attachment": attachments,
+        "/wiki/rest/api/content/c2/child/attachment": {
+            "results": [
+                {
+                    "id": "att902",
+                    "title": "reply.png",
+                    "extensions": {"fileId": "file-in-reply"},
+                }
+            ]
+        },
+    }
+
+
+async def test_comment_images_are_labelled_with_attachment_ids() -> None:
+    client = make_client(Router(comment_image_routes()))
+    output = await confluence.get_comments_impl(client, "100", limit=50)
+    assert "[attachment: bug.png, id att901]" in output
+    assert "[attachment: reply.png, id att902]" in output
+
+
+async def test_comments_without_images_skip_attachment_lookups() -> None:
+    router = Router(page_routes())
+    client = make_client(router)
+    await confluence.get_comments_impl(client, "100", limit=50)
+    assert not any(path.endswith("/child/attachment") for path in router.paths())
+
+
+async def test_comment_attachment_failure_still_renders_comment() -> None:
+    client = make_client(Router(comment_image_routes(attachment_status=403)))
+    output = await confluence.get_comments_impl(client, "100", limit=50)
+    assert "see screenshot" in output
+    assert "[attachment: file-in-comment]" in output

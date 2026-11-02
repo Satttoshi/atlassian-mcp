@@ -23,6 +23,7 @@ from .confluence_render import (
     CommentThread,
     ContentKind,
     PageRef,
+    has_media,
     normalize_attachment_id,
     page_account_ids,
     parse_page_ref,
@@ -186,10 +187,33 @@ async def fetch_comment_threads(
         ),
     )
     roots = [(c, False) for c in footer] + [(c, True) for c in inline]
-    return await _gather_limited(
+    threads = await _gather_limited(
         _with_replies(client, comment, is_inline, depth=0)
         for comment, is_inline in roots
     )
+    with_images = [t for root in threads for t in root.walk() if has_media(t.comment)]
+    await _gather_limited(_label_comment_media(client, t) for t in with_images)
+    return threads
+
+
+async def _label_comment_media(client: ConfluenceClient, thread: CommentThread) -> None:
+    """Comment attachments only exist in the v1 API; without this lookup
+    a pasted screenshot has no attachment ID and cannot be fetched."""
+    comment_id = thread.comment.get("id")
+    try:
+        data = await client.get_json(
+            f"/wiki/rest/api/content/{comment_id}/child/attachment",
+            params={"limit": 100},
+        )
+    except AtlassianError as exc:
+        logger.warning("Attachments of comment %s unavailable: %s", comment_id, exc)
+        return
+    thread.media_labels = {
+        str(file_id): f"{att.get('title', '?')}, id {att.get('id', '?')}"
+        for att in data.get("results") or []
+        if isinstance(att, dict)
+        and (file_id := (att.get("extensions") or {}).get("fileId"))
+    }
 
 
 def _thread_account_ids(threads: list[CommentThread]) -> set[str]:

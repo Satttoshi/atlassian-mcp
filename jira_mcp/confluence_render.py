@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -76,6 +77,13 @@ class CommentThread:
     comment: dict[str, Any]
     inline: bool
     replies: list[CommentThread] = field(default_factory=list)
+    # Images pasted into a comment are attached to the comment, not the page.
+    media_labels: dict[str, str] = field(default_factory=dict)
+
+    def walk(self) -> Iterator[CommentThread]:
+        yield self
+        for reply in self.replies:
+            yield from reply.walk()
 
     def count(self) -> int:
         return 1 + sum(reply.count() for reply in self.replies)
@@ -115,6 +123,11 @@ def body_markdown(
     if media_labels:
         _label_media(adf, media_labels)
     return adf_to_markdown(adf)
+
+
+def has_media(obj: dict[str, Any]) -> bool:
+    raw = ((obj.get("body") or {}).get("atlas_doc_format") or {}).get("value")
+    return isinstance(raw, str) and '"media' in raw
 
 
 def _label_media(node: Any, labels: dict[str, str]) -> None:
@@ -261,7 +274,7 @@ def _render_thread(thread: CommentThread, users: dict[str, str], depth: int) -> 
     selection = (comment.get("properties") or {}).get("inlineOriginalSelection")
     if thread.inline and selection:
         parts.append(f'> on: "{selection}"')
-    parts.append(body_markdown(comment) or "*(empty comment)*")
+    parts.append(body_markdown(comment, thread.media_labels) or "*(empty comment)*")
     parts.extend(_render_thread(reply, users, depth + 1) for reply in thread.replies)
     return "\n\n".join(parts)
 

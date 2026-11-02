@@ -611,8 +611,9 @@ async def get_confluence_attachment(attachment_id: str | int) -> Image:
 
     Args:
         attachment_id: The attachment ID as listed by get_confluence_page,
-            e.g. get_confluence_attachment(attachment_id="att123456").
-            NOT the page ID and NOT the filename.
+            or shown next to an image in a comment, e.g. "[attachment:
+            bug.png, id att123456]" -> get_confluence_attachment(
+            attachment_id="att123456"). NOT the page ID and NOT the filename.
     """
     try:
         return await confluence.get_attachment_impl(
