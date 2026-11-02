@@ -316,7 +316,8 @@ def confluence_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"accountId": "me-1"})
     if path == "/wiki/rest/api/search":
         assert request.url.params["cql"].startswith(
-            'contributor = "me-1" AND lastmodified >= "2026-10-30" '
+            'contributor = "me-1" AND type in (page, blogpost) '
+            'AND lastmodified >= "2026-10-30" '
             'AND lastmodified < "2026-10-31"'
         )
         return httpx.Response(

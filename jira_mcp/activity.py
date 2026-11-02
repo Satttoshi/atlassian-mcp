@@ -234,8 +234,9 @@ async def _confluence_events(
     client: ConfluenceClient, account_id: str, from_day: date, to_day: date
 ) -> tuple[list[Event], str | None]:
     cql = (
-        f'contributor = "{account_id}" AND lastmodified >= "{from_day}" '
-        f'AND lastmodified < "{to_day}" ORDER BY lastmodified DESC'
+        f'contributor = "{account_id}" AND type in (page, blogpost) '
+        f'AND lastmodified >= "{from_day}" AND lastmodified < "{to_day}" '
+        "ORDER BY lastmodified DESC"
     )
     data = await client.get_json(
         "/wiki/rest/api/search",
