@@ -256,8 +256,13 @@ def _attachment_hint(attachments: list[dict[str, Any]]) -> str:
 
 
 def _may_be_readable(attachment: dict[str, Any]) -> bool:
-    mime_type = str(attachment.get("mimeType") or "")
-    filename = str(attachment.get("filename") or "")
+    return may_be_readable(
+        str(attachment.get("mimeType") or ""), str(attachment.get("filename") or "")
+    )
+
+
+def may_be_readable(mime_type: str, filename: str) -> bool:
+    """Cheap pre-check for listings: could an attachment tool serve this file?"""
     return (
         mime_type.startswith("image/")
         or is_text_attachment(mime_type, filename)

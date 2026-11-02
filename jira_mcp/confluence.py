@@ -14,10 +14,11 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Iterable
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 from fastmcp.utilities.types import Image
 
+from .attachments import AttachmentMeta, read_attachment
 from .client import AtlassianError, ConfluenceClient
 from .confluence_render import (
     CommentThread,
@@ -32,13 +33,14 @@ from .confluence_render import (
     render_page_context,
     render_search_results,
 )
-from .images import check_image_metadata, image_from_payload
+from .render import may_be_readable
 
 logger = logging.getLogger(__name__)
 
 V2 = "/wiki/api/v2"
 BODY_PARAMS = {"body-format": "atlas_doc_format"}
 COMMENT_PARAMS = {"body-format": "atlas_doc_format", "sort": "created-date"}
+NEWEST_FIRST_PARAMS = {**COMMENT_PARAMS, "sort": "-created-date"}
 
 MAX_PAGE_SIZE = 250
 MAX_COMMENTS = 100
@@ -174,17 +176,22 @@ async def _with_replies(
 
 
 async def fetch_comment_threads(
-    client: ConfluenceClient, kind: ContentKind, content_id: str, limit: int
+    client: ConfluenceClient,
+    kind: ContentKind,
+    content_id: str,
+    limit: int,
+    newest_first: bool = False,
 ) -> list[CommentThread]:
-    """Footer comments first, then inline comments, each with nested replies."""
+    """Footer comments first, then inline comments, each with nested replies.
+
+    newest_first orders the top-level comments; replies stay chronological
+    so each thread still reads as a conversation.
+    """
     limit = max(1, min(limit, MAX_COMMENTS))
+    params = NEWEST_FIRST_PARAMS if newest_first else COMMENT_PARAMS
     footer, inline = await asyncio.gather(
-        _paginate(
-            client, f"{V2}/{kind}/{content_id}/footer-comments", COMMENT_PARAMS, limit
-        ),
-        _paginate(
-            client, f"{V2}/{kind}/{content_id}/inline-comments", COMMENT_PARAMS, limit
-        ),
+        _paginate(client, f"{V2}/{kind}/{content_id}/footer-comments", params, limit),
+        _paginate(client, f"{V2}/{kind}/{content_id}/inline-comments", params, limit),
     )
     roots = [(c, False) for c in footer] + [(c, True) for c in inline]
     threads = await _gather_limited(
@@ -246,10 +253,12 @@ async def get_page_impl(
 
 
 async def get_comments_impl(
-    client: ConfluenceClient, page: str | int, limit: int
+    client: ConfluenceClient, page: str | int, limit: int, newest_first: bool = False
 ) -> str:
     kind, content = await fetch_content(client, parse_page_ref(page), with_body=False)
-    threads = await fetch_comment_threads(client, kind, str(content.get("id")), limit)
+    threads = await fetch_comment_threads(
+        client, kind, str(content.get("id")), limit, newest_first
+    )
     users = await resolve_users(client, _thread_account_ids(threads))
     total = sum(thread.count() for thread in threads)
     header = f"# Comments on **{content.get('title', '?')}** ({total})"
@@ -316,15 +325,35 @@ async def search_impl(client: ConfluenceClient, query: str, limit: int) -> str:
 
 async def get_attachment_impl(
     client: ConfluenceClient, attachment_id: str | int
-) -> Image:
-    att_id = normalize_attachment_id(attachment_id)
-    # Metadata first: unsupported or oversized files are rejected before download.
-    meta = await client.get_json(f"{V2}/attachments/{att_id}")
-    filename = str(meta.get("title") or att_id)
-    image_format = check_image_metadata(
-        filename, str(meta.get("mediaType") or ""), int(meta.get("fileSize") or 0)
-    )
+) -> Image | str:
+    try:
+        att_id = normalize_attachment_id(attachment_id)
+    except ValueError:
+        # A page URL instead of an attachment ID: recover by listing its files.
+        try:
+            ref = parse_page_ref(attachment_id)
+        except ValueError:
+            raise ValueError(
+                f"'{attachment_id}' is not a valid Confluence attachment ID; "
+                "expected the ID shown in the Attachments section of "
+                "get_confluence_page (e.g. 'att123456'). NOT the page ID and "
+                "NOT the filename."
+            ) from None
+        await _reject_content_id_as_attachment_id(client, attachment_id, ref)
+        raise  # unreachable: the call above always raises
 
+    try:
+        meta = await client.get_json(f"{V2}/attachments/{att_id}")
+    except AtlassianError as exc:
+        # Bare digits may be a page ID rather than an attachment ID.
+        if exc.status_code == 404 and str(attachment_id).strip().isdigit():
+            ref = PageRef(str(attachment_id).strip(), None)
+            await _reject_content_id_as_attachment_id(
+                client, attachment_id, ref, not_found=exc
+            )
+        raise
+
+    filename = str(meta.get("title") or att_id)
     container_id = meta.get("pageId") or meta.get("blogPostId")
     candidates: list[str] = []
     if container_id:
@@ -336,12 +365,60 @@ async def get_attachment_impl(
     if not candidates:
         raise ValueError(f"Attachment '{filename}' has no download location.")
 
-    last_error: AtlassianError | None = None
-    for path in candidates:
-        try:
-            data, _ = await client.get_bytes(path)
-            return image_from_payload(filename, data, image_format)
-        except AtlassianError as exc:
-            last_error = exc
-    assert last_error is not None
-    raise last_error
+    async def download() -> bytes:
+        last_error: AtlassianError | None = None
+        for path in candidates:
+            try:
+                data, _ = await client.get_bytes(path)
+                return data
+            except AtlassianError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    return await read_attachment(
+        AttachmentMeta(
+            id=att_id,
+            filename=filename,
+            mime_type=str(meta.get("mediaType") or ""),
+            size=int(meta.get("fileSize") or 0),
+        ),
+        download,
+    )
+
+
+async def _reject_content_id_as_attachment_id(
+    client: ConfluenceClient,
+    raw: str | int,
+    ref: PageRef,
+    not_found: AtlassianError | None = None,
+) -> NoReturn:
+    """Turn the page-ID-instead-of-attachment-ID mistake into a one-step
+    recovery: the error itself lists the page's readable attachments."""
+    try:
+        kind, content = await fetch_content(client, ref, with_body=False)
+    except AtlassianError:
+        if not_found is not None:
+            raise not_found from None
+        raise
+    content_id = str(content.get("id"))
+    attachments = await fetch_attachments(client, kind, content_id)
+    readable = [
+        a
+        for a in attachments
+        if may_be_readable(str(a.get("mediaType") or ""), str(a.get("title") or ""))
+    ]
+    title = content.get("title", "?")
+    if not readable:
+        raise ValueError(
+            f"'{raw}' is the page '{title}', not an attachment ID, and it has no "
+            "readable attachments (images or text files)."
+        )
+    listing = "; ".join(
+        f"{a.get('title', '?')} = id {a.get('id', '?')}" for a in readable
+    )
+    raise ValueError(
+        f"'{raw}' is the page '{title}', not an attachment ID. Readable "
+        f"attachments on it: {listing}. Call get_confluence_attachment again "
+        "with one of these IDs."
+    )

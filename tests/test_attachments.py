@@ -9,18 +9,17 @@ import pytest
 from fastmcp import Client
 from fastmcp.utilities.types import Image
 
-from jira_mcp import server
-from jira_mcp.client import JiraClient
-from jira_mcp.config import Settings
-from jira_mcp.images import MAX_ATTACHMENT_BYTES
-from jira_mcp.server import (
+from jira_mcp import attachments, server
+from jira_mcp.attachments import (
+    MAX_ATTACHMENT_BYTES,
     MAX_INLINE_TEXT_CHARS,
     PREVIEW_LINES,
     PREVIEW_MAX_CHARS,
     SNIFF_BYTES,
-    _get_attachment_impl,
-    mcp,
 )
+from jira_mcp.client import JiraClient
+from jira_mcp.config import Settings
+from jira_mcp.server import _get_attachment_impl, mcp
 
 SITE = "https://example.atlassian.net"
 ACCOUNT = {"accountId": "abc", "displayName": "Ada"}
@@ -306,7 +305,7 @@ async def test_sniffing_tolerates_character_split_at_sample_end() -> None:
 @pytest.fixture
 def cache_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "cache"
-    monkeypatch.setattr(server, "ATTACHMENT_CACHE_DIR", path)
+    monkeypatch.setattr(attachments, "ATTACHMENT_CACHE_DIR", path)
     return path
 
 
@@ -387,7 +386,7 @@ async def test_unwritable_cache_dir_gives_clear_error(
 ) -> None:
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("")
-    monkeypatch.setattr(server, "ATTACHMENT_CACHE_DIR", blocker / "cache")
+    monkeypatch.setattr(attachments, "ATTACHMENT_CACHE_DIR", blocker / "cache")
     content = long_log(5_000).encode()
     client = make_client(AttachmentHandler(text_meta(content), content=content))
     with pytest.raises(ValueError, match="could not be saved"):

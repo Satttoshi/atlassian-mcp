@@ -10,6 +10,7 @@ from jira_mcp.client import (
     BaseUrlDetectionError,
     JiraClient,
     ReadOnlyViolationError,
+    _retry_delay,
 )
 from jira_mcp.config import Settings
 
@@ -179,3 +180,47 @@ async def test_404_error_mentions_permissions() -> None:
     client = make_client(handler)
     with pytest.raises(AtlassianError, match="permission"):
         await client.get_json("/rest/api/3/issue/NOPE-1")
+
+
+class RateLimitedHandler:
+    """Answers the first `limited` data requests with 429, then succeeds."""
+
+    def __init__(self, limited: int, retry_after: str | None = "0") -> None:
+        self.limited = limited
+        self.retry_after = retry_after
+        self.data_requests = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if str(request.url) == f"{SITE}/rest/api/3/myself":
+            return httpx.Response(200, json=ACCOUNT)
+        self.data_requests += 1
+        if self.data_requests <= self.limited:
+            headers = {"Retry-After": self.retry_after} if self.retry_after else {}
+            return httpx.Response(429, headers=headers)
+        return httpx.Response(200, json={"ok": True})
+
+
+async def test_rate_limited_request_is_retried() -> None:
+    handler = RateLimitedHandler(limited=2)
+    client = make_client(handler)
+    data = await client.get_json("/rest/api/3/issue/P-1")
+    assert data == {"ok": True}
+    assert handler.data_requests == 3
+
+
+async def test_persistent_rate_limit_surfaces_after_retries() -> None:
+    handler = RateLimitedHandler(limited=10)
+    client = make_client(handler)
+    with pytest.raises(AtlassianError, match="429"):
+        await client.get_json("/rest/api/3/issue/P-1")
+    assert handler.data_requests == 3  # first try + 2 retries
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "attempt", "expected"),
+    [("3", 0, 3.0), ("600", 0, 10.0), (None, 0, 1.0), (None, 1, 2.0), ("soon", 1, 2.0)],
+)
+def test_retry_delay(retry_after: str | None, attempt: int, expected: float) -> None:
+    headers = {"Retry-After": retry_after} if retry_after else {}
+    response = httpx.Response(429, headers=headers)
+    assert _retry_delay(response, attempt) == expected

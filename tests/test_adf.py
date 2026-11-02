@@ -271,3 +271,13 @@ def test_external_image_and_caption() -> None:
         ],
     }
     assert adf_to_markdown(doc(image)) == "[image: https://x.io/a.png]\n\n*The flow*"
+
+
+def test_inline_file_keeps_its_name() -> None:
+    inline_file = {
+        "type": "mediaInline",
+        "attrs": {"id": "uuid-1", "type": "file", "alt": "notes.txt"},
+    }
+    assert adf_to_markdown(doc(para(text("see "), inline_file))) == (
+        "see [attachment: notes.txt]"
+    )

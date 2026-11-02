@@ -5,7 +5,7 @@ ticket context (issue details, comment threads, the reference graph around a tic
 and JQL search results) and Confluence content (pages, blog posts, footer and inline
 comments, the page tree, and CQL search results), all rendered as compact Markdown.
 Image attachments from either product (the screenshot on a UI bug ticket, a diagram
-in a spec page) can be fetched for Claude to analyze visually; Jira text attachments
+in a spec page) can be fetched for Claude to analyze visually, and text attachments
 (logs, stack traces, JSON/HAR, CSV, source code, ...) come back as plain text.
 
 ## What it deliberately cannot do
@@ -38,10 +38,10 @@ transitions, deletes, or comments on anything. Enforcement is layered:
 | Tool | Purpose |
 |---|---|
 | `get_confluence_page(page, include_comments=True)` | A page or blog post (by numeric ID or URL): space, version, author/owner, labels, URL, the full body (tables, task lists, macros; embedded Jira issues shown as `[Jira issue: KEY]`; embedded images labelled with their attachment ID), the attachment list, and (by default) all footer + inline comments with reply threads |
-| `get_confluence_comments(page, limit=100)` | Just the discussion: footer comments, then inline comments (quoting the highlighted text, marked if resolved), replies nested |
+| `get_confluence_comments(page, limit=100, newest_first=False)` | Just the discussion: footer comments, then inline comments (quoting the highlighted text, marked if resolved), replies nested. Images pasted into comments are labelled with their attachment ID |
 | `get_confluence_page_context(page)` | Where the page sits in the tree: ancestors (top-level first) and direct children, each with title + ID |
 | `search_confluence(query, limit=25)` | Plain words run a full-text search over pages and blog posts; anything with CQL syntax (`space = ENG AND title ~ "auth"`) is sent as CQL |
-| `get_confluence_attachment(attachment_id)` | Downloads an image attachment (`att…` ID from `get_confluence_page`) as vision input. Same limits as Jira: png/jpeg/gif/webp, max 5 MB |
+| `get_confluence_attachment(attachment_id)` | Downloads an attachment of a page or comment (`att…` ID from `get_confluence_page`/`get_confluence_comments`). Same behavior as `get_attachment`: images as vision input, text files as text (long ones saved to a file with a preview), max 5 MB. Passing a page ID or URL by mistake returns that page's readable attachment IDs |
 
 ### Both
 
