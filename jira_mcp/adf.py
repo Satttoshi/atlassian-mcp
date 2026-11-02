@@ -207,7 +207,7 @@ def _render_table(node: dict[str, Any]) -> str:
 
 
 def _render_media(node: dict[str, Any], attrs: dict[str, Any]) -> str:
-    if node.get("type") == "media":
+    if node.get("type") in ("media", "mediaInline"):
         if attrs.get("type") == "external" and attrs.get("url"):
             return f"[image: {attrs['url']}]"
         name = attrs.get("alt") or attrs.get("id") or "media"

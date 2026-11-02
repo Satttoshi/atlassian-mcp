@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastmcp.utilities.types import Image
 
 from jira_mcp import confluence
 from jira_mcp.client import AtlassianError, ConfluenceClient, ReadOnlyViolationError
@@ -448,6 +449,7 @@ async def test_image_attachment_is_downloaded_via_rest() -> None:
     }
     client = make_client(Router(routes))
     image = await confluence.get_attachment_impl(client, "555")
+    assert isinstance(image, Image)
     assert image.data == PNG_BYTES
     assert image._mime_type == "image/png"
 
@@ -461,6 +463,7 @@ async def test_download_falls_back_to_download_link() -> None:
     }
     client = make_client(Router(routes))
     image = await confluence.get_attachment_impl(client, "att555")
+    assert isinstance(image, Image)
     assert image.data == PNG_BYTES
 
 
@@ -472,6 +475,151 @@ async def test_non_image_attachment_is_rejected_without_download() -> None:
     }
     router = Router(routes)
     client = make_client(router)
-    with pytest.raises(ValueError, match="cannot be analysed visually"):
+    with pytest.raises(ValueError, match="cannot be read"):
         await confluence.get_attachment_impl(client, "att555")
     assert not any("download" in path for path in router.paths())
+
+
+def media_para(file_id: str) -> dict[str, Any]:
+    return {
+        "type": "mediaSingle",
+        "content": [{"type": "media", "attrs": {"id": file_id, "type": "file"}}],
+    }
+
+
+def comment_image_routes(attachment_status: int = 200) -> dict[str, Route]:
+    with_image = comment("c1", "u1", "see screenshot")
+    with_image["body"] = adf(para("see screenshot"), media_para("file-in-comment"))
+    reply = comment("c2", "u1", "and this one")
+    reply["body"] = adf(media_para("file-in-reply"))
+    attachments: Route = (
+        httpx.Response(attachment_status)
+        if attachment_status != 200
+        else {
+            "results": [
+                {
+                    "id": "att901",
+                    "title": "bug.png",
+                    "extensions": {"fileId": "file-in-comment"},
+                }
+            ]
+        }
+    )
+    return {
+        f"{V2}/pages/100": PAGE,
+        f"{V2}/pages/100/footer-comments": {"results": [with_image]},
+        f"{V2}/pages/100/inline-comments": {"results": []},
+        f"{V2}/footer-comments/c1/children": {"results": [reply]},
+        f"{V2}/footer-comments/c2/children": {"results": []},
+        "/wiki/rest/api/content/c1/child/attachment": attachments,
+        "/wiki/rest/api/content/c2/child/attachment": {
+            "results": [
+                {
+                    "id": "att902",
+                    "title": "reply.png",
+                    "extensions": {"fileId": "file-in-reply"},
+                }
+            ]
+        },
+    }
+
+
+async def test_comment_images_are_labelled_with_attachment_ids() -> None:
+    client = make_client(Router(comment_image_routes()))
+    output = await confluence.get_comments_impl(client, "100", limit=50)
+    assert "[attachment: bug.png, id att901]" in output
+    assert "[attachment: reply.png, id att902]" in output
+
+
+async def test_comments_without_images_skip_attachment_lookups() -> None:
+    router = Router(page_routes())
+    client = make_client(router)
+    await confluence.get_comments_impl(client, "100", limit=50)
+    assert not any(path.endswith("/child/attachment") for path in router.paths())
+
+
+async def test_comment_attachment_failure_still_renders_comment() -> None:
+    client = make_client(Router(comment_image_routes(attachment_status=403)))
+    output = await confluence.get_comments_impl(client, "100", limit=50)
+    assert "see screenshot" in output
+    assert "[attachment: file-in-comment]" in output
+
+
+async def test_text_attachment_is_returned_as_text() -> None:
+    content = b'{"retries": 3}'
+    routes: dict[str, Route] = {
+        f"{V2}/attachments/att555": attachment_meta(
+            title="config.json", mediaType="application/json", fileSize=len(content)
+        ),
+        REST_DOWNLOAD: httpx.Response(200, content=content),
+    }
+    client = make_client(Router(routes))
+    result = await confluence.get_attachment_impl(client, "att555")
+    assert result == (
+        'Attachment: config.json (application/json, 14 B)\n\n{"retries": 3}'
+    )
+
+
+async def test_page_hint_covers_text_attachments() -> None:
+    routes = page_routes()
+    routes[f"{V2}/pages/100/attachments"] = {
+        "results": [
+            {"id": "att7", "title": "spec.pdf", "mediaType": "application/pdf"},
+            {"id": "att8", "title": "app.log", "mediaType": "text/plain"},
+        ]
+    }
+    client = make_client(Router(routes))
+    output = await confluence.get_page_impl(client, "100", include_comments=False)
+    assert 'get_confluence_attachment(attachment_id="att8")' in output
+
+
+def page_with_attachments_routes() -> dict[str, Route]:
+    return {
+        f"{V2}/pages/100": PAGE,
+        f"{V2}/pages/100/attachments": {
+            "results": [
+                {"id": "att555", "title": "flow.png", "mediaType": "image/png"},
+                {"id": "att556", "title": "spec.pdf", "mediaType": "application/pdf"},
+                {"id": "att557", "title": "app.log", "mediaType": "text/plain"},
+            ]
+        },
+    }
+
+
+async def test_page_id_as_attachment_id_lists_readable_attachments() -> None:
+    client = make_client(Router(page_with_attachments_routes()))
+    with pytest.raises(ValueError, match="not an attachment ID") as exc:
+        await confluence.get_attachment_impl(client, "100")
+    message = str(exc.value)
+    assert "flow.png = id att555" in message
+    assert "app.log = id att557" in message
+    assert "spec.pdf" not in message  # PDFs cannot be read, so not offered
+
+
+async def test_page_url_as_attachment_id_lists_readable_attachments() -> None:
+    client = make_client(Router(page_with_attachments_routes()))
+    with pytest.raises(ValueError, match="flow.png = id att555"):
+        await confluence.get_attachment_impl(
+            client, f"{SITE}/wiki/spaces/ENG/pages/100/Checkout"
+        )
+
+
+async def test_unknown_numeric_id_keeps_the_404() -> None:
+    client = make_client(Router({}))
+    with pytest.raises(AtlassianError, match="404") as exc:
+        await confluence.get_attachment_impl(client, "999")
+    assert "/attachments/att999" in str(exc.value)
+
+
+async def test_newest_first_sorts_top_level_comments_descending() -> None:
+    router = Router(page_routes())
+    client = make_client(router)
+    await confluence.get_comments_impl(client, "100", limit=50, newest_first=True)
+    sorts = {
+        r.url.path: r.url.params.get("sort")
+        for r in router.requests
+        if "comments" in r.url.path
+    }
+    assert sorts[f"{V2}/pages/100/footer-comments"] == "-created-date"
+    assert sorts[f"{V2}/pages/100/inline-comments"] == "-created-date"
+    assert sorts[f"{V2}/footer-comments/c1/children"] == "created-date"

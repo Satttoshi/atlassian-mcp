@@ -11,11 +11,12 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .adf import adf_to_markdown
-from .render import format_size
+from .render import format_size, may_be_readable
 
 ContentKind = Literal["pages", "blogposts"]
 
@@ -76,6 +77,13 @@ class CommentThread:
     comment: dict[str, Any]
     inline: bool
     replies: list[CommentThread] = field(default_factory=list)
+    # Images pasted into a comment are attached to the comment, not the page.
+    media_labels: dict[str, str] = field(default_factory=dict)
+
+    def walk(self) -> Iterator[CommentThread]:
+        yield self
+        for reply in self.replies:
+            yield from reply.walk()
 
     def count(self) -> int:
         return 1 + sum(reply.count() for reply in self.replies)
@@ -117,12 +125,17 @@ def body_markdown(
     return adf_to_markdown(adf)
 
 
+def has_media(obj: dict[str, Any]) -> bool:
+    raw = ((obj.get("body") or {}).get("atlas_doc_format") or {}).get("value")
+    return isinstance(raw, str) and '"media' in raw
+
+
 def _label_media(node: Any, labels: dict[str, str]) -> None:
     """Replace opaque media file IDs with "filename, id attNNN" so images in
     the body can be matched to fetchable attachments."""
     if isinstance(node, dict):
         attrs = node.get("attrs")
-        if node.get("type") == "media" and isinstance(attrs, dict):
+        if node.get("type") in ("media", "mediaInline") and isinstance(attrs, dict):
             label = labels.get(str(attrs.get("id")))
             if label:
                 attrs["alt"] = label
@@ -222,16 +235,17 @@ def _attachment_line(attachment: dict[str, Any]) -> str:
 
 
 def _attachment_hint(attachments: list[dict[str, Any]]) -> str:
-    image_ids = [
+    readable_ids = [
         str(a.get("id"))
         for a in attachments
-        if str(a.get("mediaType") or "").startswith("image/") and a.get("id")
+        if a.get("id")
+        and may_be_readable(str(a.get("mediaType") or ""), str(a.get("title") or ""))
     ]
-    if not image_ids:
+    if not readable_ids:
         return ""
     return (
-        "*(fetch images for visual analysis with the attachment id, e.g. "
-        f'get_confluence_attachment(attachment_id="{image_ids[0]}"))*'
+        "*(fetch images or text files (logs, JSON, CSV, ...) with the attachment "
+        f'id, e.g. get_confluence_attachment(attachment_id="{readable_ids[0]}"))*'
     )
 
 
@@ -261,7 +275,7 @@ def _render_thread(thread: CommentThread, users: dict[str, str], depth: int) -> 
     selection = (comment.get("properties") or {}).get("inlineOriginalSelection")
     if thread.inline and selection:
         parts.append(f'> on: "{selection}"')
-    parts.append(body_markdown(comment) or "*(empty comment)*")
+    parts.append(body_markdown(comment, thread.media_labels) or "*(empty comment)*")
     parts.extend(_render_thread(reply, users, depth + 1) for reply in thread.replies)
     return "\n\n".join(parts)
 

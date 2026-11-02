@@ -19,6 +19,7 @@ Two invariants live here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,11 @@ MYSELF_PATH = "/rest/api/3/myself"
 CONFLUENCE_CURRENT_USER_PATH = "/wiki/rest/api/user/current"
 
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+# 429s are retried, honouring Retry-After up to a cap so a tool call never
+# hangs for minutes; past the retries the 429 surfaces as an error.
+MAX_RETRIES = 2
+MAX_RETRY_DELAY = 10.0
 
 
 @dataclass(frozen=True)
@@ -152,9 +158,17 @@ class AtlassianClient:
                 f"Only GET requests are permitted, plus POST to {sorted(allowed_posts)}."
             )
         base = await self._ensure_base_url()
-        response = await self._http.request(
-            method, f"{base}{path}", params=params, json=json_body, headers=headers
-        )
+        for attempt in range(MAX_RETRIES + 1):
+            response = await self._http.request(
+                method, f"{base}{path}", params=params, json=json_body, headers=headers
+            )
+            if response.status_code != 429 or attempt == MAX_RETRIES:
+                break
+            delay = _retry_delay(response, attempt)
+            logger.info(
+                "%s rate-limited %s; retrying in %.1fs", self.product.name, path, delay
+            )
+            await asyncio.sleep(delay)
         self._raise_for_status(response, path)
         return response
 
@@ -305,6 +319,14 @@ class AtlassianClient:
         else:
             message = f"{name} returned HTTP {status} for {path}: {response.text[:300]}"
         raise AtlassianError(message, status_code=status)
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    try:
+        delay = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        delay = 2.0**attempt
+    return max(0.0, min(delay, MAX_RETRY_DELAY))
 
 
 class JiraClient(AtlassianClient):
