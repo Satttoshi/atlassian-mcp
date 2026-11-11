@@ -17,7 +17,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
 
-from . import confluence
+from . import confluence, writes
 from .attachments import AttachmentMeta, read_attachment
 from .client import (
     MYSELF_PATH,
@@ -25,6 +25,7 @@ from .client import (
     AtlassianError,
     ConfluenceClient,
     JiraClient,
+    JiraWriteClient,
 )
 from .config import ENV_FILE, ConfigError, Settings, load_settings
 from .confluence_render import render_remote_links
@@ -610,7 +611,34 @@ def main() -> None:
         # up — the standard way to call async code from a sync entry point.
         sys.exit(asyncio.run(_run_check(args.check or None, args.page)))
 
+    _register_writes()
     mcp.run()  # stdio transport is FastMCP's default
+
+
+_write_client: JiraWriteClient | None = None
+
+
+def _get_write_client() -> JiraWriteClient:
+    global _write_client
+    if _write_client is None:
+        _write_client = JiraWriteClient(load_settings())
+    return _write_client
+
+
+def _register_writes() -> None:
+    try:
+        settings = load_settings()
+    except ConfigError:
+        return  # the read tools report the config error on first use
+    if not settings.writes_enabled:
+        if settings.jira_write_api_token:
+            logger.warning("Jira writes stay disabled: JIRA_WRITE_PROJECTS is not set.")
+        return
+    writes.register(mcp, _get_write_client)
+    logger.info(
+        "Jira writes enabled for projects: %s",
+        ", ".join(sorted(settings.jira_write_projects)),
+    )
 
 
 if __name__ == "__main__":

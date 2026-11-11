@@ -294,7 +294,10 @@ def render_comments(comments: list[dict[str, Any]]) -> str:
         if isinstance(vis, dict):
             visibility = f" [visible to {vis.get('type', '')}: {vis.get('value', '')}]"
         body = adf_to_markdown(comment.get("body"))
-        blocks.append(f"### {author} — {created}{edited}{visibility}\n\n{body}")
+        comment_id = f" (comment {comment['id']})" if comment.get("id") else ""
+        blocks.append(
+            f"### {author} — {created}{edited}{visibility}{comment_id}\n\n{body}"
+        )
     return "\n\n".join(blocks)
 
 
@@ -330,7 +333,8 @@ def render_context(
             relation, other = link_type.get("inward", "relates to"), link["inwardIssue"]
         else:
             continue
-        lines.append(f"- {relation} {_issue_line(other)}")
+        link_id = f" (link {link['id']})" if link.get("id") else ""
+        lines.append(f"- {relation} {_issue_line(other)}{link_id}")
         rendered_links += 1
     if not rendered_links:
         lines.append("*(none)*")
