@@ -18,7 +18,7 @@ from jira_mcp.attachments import (
     SNIFF_BYTES,
 )
 from jira_mcp.client import JiraClient
-from jira_mcp.config import Settings
+from jira_mcp.config import Settings, parse_sites
 from jira_mcp.server import _get_attachment_impl, mcp
 
 SITE = "https://example.atlassian.net"
@@ -30,7 +30,7 @@ def make_client(handler: Callable[[httpx.Request], httpx.Response]) -> JiraClien
     settings = Settings(
         email="ada@x.io",
         api_token="secret",
-        site_url=SITE,
+        sites=parse_sites(SITE),
         cloud_id=None,
         env_file_found=True,
     )
@@ -406,7 +406,9 @@ async def test_tool_returns_text_and_image_content_over_mcp(
         att_id = str(request.url).rstrip("/").rpartition("/")[2]
         return handlers.get(att_id, handlers["1"])(request)
 
-    monkeypatch.setattr(server, "_client", make_client(handler))
+    client = make_client(handler)
+    monkeypatch.setattr(server, "_settings", client._settings)
+    monkeypatch.setattr(server, "_clients", {client.site.name: client})
     async with Client(mcp) as mcp_client:
         text_result = await mcp_client.call_tool(
             "get_attachment", {"attachment_id": "1"}

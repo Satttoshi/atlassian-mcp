@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 
-from .config import Settings
+from .config import Settings, Site, Token
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,6 @@ class Product:
     gateway: str
     # Must return the authenticated account (with accountId) when auth works.
     probe_path: str
-    token_env: str
     scopes: str
     not_found_hint: str
     allowed_post_paths: frozenset[str] = frozenset()
@@ -59,7 +58,6 @@ JIRA = Product(
     name="Jira",
     gateway="jira",
     probe_path=MYSELF_PATH,
-    token_env="ATLASSIAN_API_TOKEN",
     scopes="read:jira-work and read:jira-user",
     not_found_hint="Jira reports issues you cannot view as 404",
     allowed_post_paths=frozenset({"/rest/api/3/search/jql"}),
@@ -69,7 +67,6 @@ CONFLUENCE = Product(
     name="Confluence",
     gateway="confluence",
     probe_path=CONFLUENCE_CURRENT_USER_PATH,
-    token_env="CONFLUENCE_API_TOKEN (or ATLASSIAN_API_TOKEN)",
     scopes="the Confluence read scopes listed in the README",
     not_found_hint="Confluence reports pages you cannot view as 404",
 )
@@ -96,14 +93,17 @@ class AtlassianClient:
         self,
         settings: Settings,
         product: Product,
-        api_token: str,
+        token: Token,
         http: httpx.AsyncClient | None = None,
+        site: Site | None = None,
     ) -> None:
         self._settings = settings
         self.product = product
+        self.site = site or settings.default_site
+        self.token_source = token.source
         # Basic auth (email:token); the token itself is never logged.
         self._http = http or httpx.AsyncClient(
-            auth=(settings.email, api_token),
+            auth=(settings.email, token.value),
             timeout=DEFAULT_TIMEOUT,
             headers={"Accept": "application/json"},
             follow_redirects=True,
@@ -122,7 +122,7 @@ class AtlassianClient:
 
     @property
     def site_url(self) -> str:
-        return self._settings.site_url
+        return self.site.url
 
     # -- public request helpers ------------------------------------------------
 
@@ -195,7 +195,7 @@ class AtlassianClient:
                 raise BaseUrlDetectionError(
                     f"ATLASSIAN_CLOUD_ID is set, but {name} authentication against "
                     f"{base} failed. Check the cloud ID, ATLASSIAN_EMAIL and "
-                    f"{self.product.token_env}."
+                    f"{self.token_source}."
                 )
             logger.info(
                 "%s base URL: %s (ATLASSIAN_CLOUD_ID override, no detection)",
@@ -204,7 +204,7 @@ class AtlassianClient:
             )
             return self._select(base, account, fallback=False)
 
-        site = self._settings.site_url
+        site = self.site.url
         account = await self._probe(site)
         if account is not None:
             logger.info(
@@ -226,7 +226,7 @@ class AtlassianClient:
         if account is None:
             raise BaseUrlDetectionError(
                 f"{name} authentication failed against both {site} and {base}. "
-                f"Check ATLASSIAN_EMAIL and {self.product.token_env}. If the token "
+                f"Check ATLASSIAN_EMAIL and {self.token_source}. If the token "
                 f"is scoped, confirm it was created for {name} with "
                 f"{self.product.scopes}."
             )
@@ -305,7 +305,7 @@ class AtlassianClient:
         if status == 401:
             message = (
                 f"401 Unauthorized: {name} rejected the credentials. Check "
-                f"ATLASSIAN_EMAIL and {self.product.token_env} (tokens expire and "
+                f"ATLASSIAN_EMAIL and {self.token_source} (tokens expire and "
                 "can be revoked)."
             )
         elif status == 403:
@@ -337,9 +337,12 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
 
 class JiraClient(AtlassianClient):
     def __init__(
-        self, settings: Settings, http: httpx.AsyncClient | None = None
+        self,
+        settings: Settings,
+        http: httpx.AsyncClient | None = None,
+        site: Site | None = None,
     ) -> None:
-        super().__init__(settings, JIRA, settings.api_token, http)
+        super().__init__(settings, JIRA, settings.jira_token, http, site)
 
     async def search_jql(self, body: dict[str, Any]) -> Any:
         response = await self._request("POST", "/rest/api/3/search/jql", json_body=body)
@@ -348,16 +351,18 @@ class JiraClient(AtlassianClient):
 
 class ConfluenceClient(AtlassianClient):
     def __init__(
-        self, settings: Settings, http: httpx.AsyncClient | None = None
+        self,
+        settings: Settings,
+        http: httpx.AsyncClient | None = None,
+        site: Site | None = None,
     ) -> None:
-        super().__init__(settings, CONFLUENCE, settings.confluence_token, http)
+        super().__init__(settings, CONFLUENCE, settings.confluence_token, http, site)
 
 
 JIRA_WRITE = Product(
     name="Jira (write)",
     gateway="jira",
     probe_path=MYSELF_PATH,
-    token_env="JIRA_WRITE_API_TOKEN (or ATLASSIAN_API_TOKEN)",
     scopes="read:jira-work, write:jira-work and read:jira-user",
     not_found_hint="Jira reports issues you cannot view as 404",
     allowed_post_paths=frozenset({"/rest/api/3/search/jql"}),
@@ -395,13 +400,16 @@ class JiraWriteClient(AtlassianClient):
     """
 
     def __init__(
-        self, settings: Settings, http: httpx.AsyncClient | None = None
+        self,
+        settings: Settings,
+        http: httpx.AsyncClient | None = None,
+        site: Site | None = None,
     ) -> None:
         if not settings.writes_enabled:
             raise WriteNotAllowedError(
                 "Jira writes are disabled: set JIRA_WRITE_PROJECTS in .env."
             )
-        super().__init__(settings, JIRA_WRITE, settings.write_token, http)
+        super().__init__(settings, JIRA_WRITE, settings.write_token, http, site)
         self.projects = settings.jira_write_projects
 
     def require_project(self, issue_key: str) -> None:

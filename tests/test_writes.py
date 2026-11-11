@@ -15,7 +15,7 @@ from jira_mcp.client import (
     ReadOnlyViolationError,
     WriteNotAllowedError,
 )
-from jira_mcp.config import Settings, _parse_projects
+from jira_mcp.config import Settings, Site, Token, _parse_projects
 
 SITE = "https://example.atlassian.net"
 ACCOUNT = {"accountId": "abc", "displayName": "Ada"}
@@ -35,11 +35,16 @@ LINK_TYPES = {
 }
 
 
-def settings(projects: str = "AC", token: str | None = "write-secret") -> Settings:
+def settings(
+    projects: str = "AC",
+    token: str | None = "write-secret",
+    jira_token: str | None = None,
+) -> Settings:
     return Settings(
         email="ada@x.io",
+        sites=(Site("example", SITE),),
         api_token="read-secret",
-        site_url=SITE,
+        jira_api_token=jira_token,
         cloud_id=None,
         env_file_found=True,
         jira_write_api_token=token,
@@ -90,8 +95,13 @@ def test_writes_need_projects_token_falls_back() -> None:
     assert settings().writes_enabled
     assert not settings(projects="").writes_enabled
     assert settings(token=None).writes_enabled
-    assert settings(token=None).write_token == "read-secret"
-    assert settings().write_token == "write-secret"
+    assert settings(token=None).write_token == Token(
+        "read-secret", "ATLASSIAN_API_TOKEN"
+    )
+    assert settings(token=None, jira_token="jira-secret").write_token == Token(
+        "jira-secret", "JIRA_API_TOKEN"
+    )
+    assert settings().write_token == Token("write-secret", "JIRA_WRITE_API_TOKEN")
     with pytest.raises(WriteNotAllowedError):
         JiraWriteClient(settings(projects=""))
 
@@ -309,7 +319,27 @@ async def test_register_adds_tools_and_instructions() -> None:
         "edited, commented on, or transitioned.",
     )
     client = make(Recorder())
-    writes.register(mcp, lambda: client)
-    names = {tool.name for tool in await mcp.list_tools()}
-    assert {"update_issue", "create_issue", "link_issues", "unlink_issues"} <= names
+    routed: list[tuple[str | None, str | None, str | int | None]] = []
+
+    async def client_for(
+        site: str | None,
+        *,
+        issue_key: str | None = None,
+        link_id: str | int | None = None,
+    ) -> JiraWriteClient:
+        routed.append((site, issue_key, link_id))
+        return client
+
+    writes.register(mcp, client_for, frozenset({"AC"}))
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    assert {"update_issue", "create_issue", "link_issues", "unlink_issues"} <= set(
+        tools
+    )
+    assert all("site" in tool.parameters["properties"] for tool in tools.values())
     assert "enabled for Jira projects AC only" in (mcp.instructions or "")
+
+    await mcp.call_tool("add_comment", {"issue_key": "AC-74", "body": "hi"})
+    await mcp.call_tool(
+        "create_issue", {"project": "ac", "summary": "s", "site": "example"}
+    )
+    assert routed == [(None, "AC-74", None), ("example", "AC-0", None)]

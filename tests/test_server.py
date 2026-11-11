@@ -7,7 +7,7 @@ import pytest
 
 from jira_mcp import server
 from jira_mcp.client import JiraClient
-from jira_mcp.config import Settings
+from jira_mcp.config import Settings, parse_sites
 from jira_mcp.server import _get_issue_context_impl, _get_issue_impl
 
 SITE = "https://example.atlassian.net"
@@ -29,16 +29,16 @@ ISSUE = {
 
 @pytest.fixture(autouse=True)
 def reset_field_name_cache() -> Iterator[None]:
-    server._field_names = None
+    server._field_names.clear()
     yield
-    server._field_names = None
+    server._field_names.clear()
 
 
 def make_client(handler: Callable[[httpx.Request], httpx.Response]) -> JiraClient:
     settings = Settings(
         email="ada@x.io",
         api_token="secret",
-        site_url=SITE,
+        sites=parse_sites(SITE),
         cloud_id=None,
         env_file_found=True,
     )

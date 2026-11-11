@@ -12,7 +12,7 @@ from jira_mcp.client import (
     ReadOnlyViolationError,
     _retry_delay,
 )
-from jira_mcp.config import Settings
+from jira_mcp.config import Settings, parse_sites
 
 SITE = "https://example.atlassian.net"
 CLOUD_BASE = "https://api.atlassian.com/ex/jira/cid-123"
@@ -23,7 +23,7 @@ def settings(cloud_id: str | None = None) -> Settings:
     return Settings(
         email="ada@x.io",
         api_token="secret",
-        site_url=SITE,
+        sites=parse_sites(SITE),
         cloud_id=cloud_id,
         env_file_found=True,
     )

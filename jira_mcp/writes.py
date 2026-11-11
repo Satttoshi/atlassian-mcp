@@ -7,8 +7,8 @@ not Markdown or ADF.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -24,6 +24,18 @@ WIKI_MARKUP_HINT = (
 )
 
 UNASSIGN = {"", "none", "unassigned"}
+
+
+class ClientFor(Protocol):
+    """Returns the write client for the site an issue key or link ID is on."""
+
+    async def __call__(
+        self,
+        site: str | None,
+        *,
+        issue_key: str | None = None,
+        link_id: str | int | None = None,
+    ) -> JiraWriteClient: ...
 
 
 def _url(client: JiraWriteClient, key: str) -> str:
@@ -289,12 +301,15 @@ async def unlink_issues_impl(client: JiraWriteClient, link_id: str | int) -> str
 # -- tool registration --------------------------------------------------------------
 
 
-def register(mcp: FastMCP, get_client: Callable[[], JiraWriteClient]) -> None:
-    projects = ", ".join(sorted(get_client().projects))
+def register(mcp: FastMCP, client_for: ClientFor, projects: frozenset[str]) -> None:
+    project_list = ", ".join(sorted(projects))
 
-    async def run(coro: Any) -> str:
+    async def run(
+        client: Awaitable[JiraWriteClient],
+        impl: Callable[[JiraWriteClient], Awaitable[str]],
+    ) -> str:
         try:
-            return str(await coro)
+            return str(await impl(await client))
         except (
             AtlassianError,
             ConfigError,
@@ -312,6 +327,7 @@ def register(mcp: FastMCP, get_client: Callable[[], JiraWriteClient]) -> None:
         assignee: str | None = None,
         labels: list[str] | None = None,
         fields: dict[str, Any] | None = None,
+        site: str | None = None,
     ) -> str:
         """Change fields of an existing Jira issue. Only the passed fields change.
 
@@ -324,13 +340,16 @@ def register(mcp: FastMCP, get_client: Callable[[], JiraWriteClient]) -> None:
             fields: other fields by display name or ID, e.g.
                 {"Acceptance Criteria": "...", "Epic Link": "AC-38",
                 "Story Points": 3}. Rich-text fields take wiki markup.
+            site: Only with several configured sites: the site name. Optional
+                here, the issue key's project identifies the site.
 
         Read the issue with get_issue first; never overwrite text you haven't read.
         """
         return await run(
-            update_issue_impl(
-                get_client(), issue_key, summary, description, assignee, labels, fields
-            )
+            client_for(site, issue_key=issue_key),
+            lambda c: update_issue_impl(
+                c, issue_key, summary, description, assignee, labels, fields
+            ),
         )
 
     @mcp.tool
@@ -342,6 +361,7 @@ def register(mcp: FastMCP, get_client: Callable[[], JiraWriteClient]) -> None:
         parent: str | None = None,
         assignee: str | None = None,
         fields: dict[str, Any] | None = None,
+        site: str | None = None,
     ) -> str:
         """Create a Jira issue and return its key.
 
@@ -354,67 +374,113 @@ def register(mcp: FastMCP, get_client: Callable[[], JiraWriteClient]) -> None:
                 pass {"Epic Link": "AC-38"} in fields instead.
             assignee: display name or email of an assignable user.
             fields: other fields by display name or ID.
+            site: Only with several configured sites: the site name. Optional
+                here, the project identifies the site.
         """
         return await run(
-            create_issue_impl(
-                get_client(),
-                project,
-                summary,
-                description,
-                issue_type,
-                parent,
-                assignee,
-                fields,
-            )
+            client_for(site, issue_key=f"{project.strip().upper()}-0"),
+            lambda c: create_issue_impl(
+                c, project, summary, description, issue_type, parent, assignee, fields
+            ),
         )
 
     @mcp.tool
-    async def add_comment(issue_key: str, body: str) -> str:
-        """Add a comment to a Jira issue."""
-        return await run(add_comment_impl(get_client(), issue_key, body))
+    async def add_comment(issue_key: str, body: str, site: str | None = None) -> str:
+        """Add a comment to a Jira issue.
+
+        Args:
+            issue_key: e.g. "AC-69".
+            body: the comment text.
+            site: Only with several configured sites: the site name. Optional
+                here, the issue key's project identifies the site.
+        """
+        return await run(
+            client_for(site, issue_key=issue_key),
+            lambda c: add_comment_impl(c, issue_key, body),
+        )
 
     @mcp.tool
-    async def edit_comment(issue_key: str, comment_id: str | int, body: str) -> str:
+    async def edit_comment(
+        issue_key: str, comment_id: str | int, body: str, site: str | None = None
+    ) -> str:
         """Replace the text of an existing comment.
 
         get_issue and get_comments show each comment's ID as "(comment 12345)".
         Pass the full new text; it replaces the old one.
+
+        Args:
+            issue_key: the issue the comment is on, e.g. "AC-69".
+            comment_id: e.g. 12345.
+            body: the full new text.
+            site: Only with several configured sites: the site name. Optional
+                here, the issue key's project identifies the site.
         """
-        return await run(edit_comment_impl(get_client(), issue_key, comment_id, body))
+        return await run(
+            client_for(site, issue_key=issue_key),
+            lambda c: edit_comment_impl(c, issue_key, comment_id, body),
+        )
 
     @mcp.tool
-    async def transition_issue(issue_key: str, status: str) -> str:
+    async def transition_issue(
+        issue_key: str, status: str, site: str | None = None
+    ) -> str:
         """Move an issue to another status, e.g. "DONE", "In Progress".
 
         Matches the transition name or the target status. On no match, the
         error lists the statuses the issue can move to.
+
+        Args:
+            issue_key: e.g. "AC-69".
+            status: the transition or target status name.
+            site: Only with several configured sites: the site name. Optional
+                here, the issue key's project identifies the site.
         """
-        return await run(transition_issue_impl(get_client(), issue_key, status))
+        return await run(
+            client_for(site, issue_key=issue_key),
+            lambda c: transition_issue_impl(c, issue_key, status),
+        )
 
     @mcp.tool
-    async def link_issues(issue_key: str, relation: str, other_key: str) -> str:
+    async def link_issues(
+        issue_key: str, relation: str, other_key: str, site: str | None = None
+    ) -> str:
         """Link two issues so that "<issue_key> <relation> <other_key>" is true.
 
         Args:
             issue_key: e.g. "AC-66".
             relation: the phrase as Jira shows it, e.g. "is blocked by",
                 "blocks", "relates to", "duplicates", "clones".
-            other_key: e.g. "AC-14".
+            other_key: e.g. "AC-14". Must be on the same site as issue_key.
+            site: Only with several configured sites: the site name. Optional
+                here, issue_key's project identifies the site.
 
         Example: link_issues("AC-66", "is blocked by", "AC-14"). After
         creating, the link is read back and its direction checked.
         """
-        return await run(link_issues_impl(get_client(), issue_key, relation, other_key))
+        return await run(
+            client_for(site, issue_key=issue_key),
+            lambda c: link_issues_impl(c, issue_key, relation, other_key),
+        )
 
     @mcp.tool
-    async def unlink_issues(link_id: str | int) -> str:
-        """Remove one issue link. get_issue_context shows link IDs as "(link 12345)"."""
-        return await run(unlink_issues_impl(get_client(), link_id))
+    async def unlink_issues(link_id: str | int, site: str | None = None) -> str:
+        """Remove one issue link. get_issue_context shows link IDs as "(link 12345)".
+
+        Args:
+            link_id: e.g. 12345.
+            site: Only with several configured sites: the site name shown at
+                the top of the get_issue_context result the ID came from.
+                Required then, since a link ID does not identify a site.
+        """
+        return await run(
+            client_for(site, link_id=link_id),
+            lambda c: unlink_issues_impl(c, link_id),
+        )
 
     mcp.instructions = (mcp.instructions or "").replace(
         "Constraints: strictly read-only; nothing can be created, edited, "
         "commented on, or transitioned.",
-        f"Writes: enabled for Jira projects {projects} only (update_issue, "
+        f"Writes: enabled for Jira projects {project_list} only (update_issue, "
         "create_issue, add_comment, edit_comment, transition_issue, link_issues, "
         "unlink_issues). Nothing can be deleted except an issue link. Confluence "
         f"stays read-only. {WIKI_MARKUP_HINT} Read an issue before changing it, "

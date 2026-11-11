@@ -20,14 +20,22 @@ from fastmcp.utilities.types import Image
 from . import activity, confluence, writes
 from .attachments import AttachmentMeta, read_attachment
 from .client import (
-    MYSELF_PATH,
     AtlassianClient,
     AtlassianError,
     ConfluenceClient,
     JiraClient,
     JiraWriteClient,
 )
-from .config import ENV_FILE, ConfigError, Settings, load_settings
+from .config import (
+    ENV_FILE,
+    ConfigError,
+    Settings,
+    Site,
+    describe_sites,
+    find_site,
+    load_settings,
+    site_from_url,
+)
 from .confluence_render import render_remote_links
 from .render import (
     normalize_issue_key,
@@ -69,6 +77,13 @@ mcp: FastMCP = FastMCP(
         "and text files attached to a page or comment with "
         "get_confluence_attachment.\n"
         "\n"
+        "Sites: several Atlassian sites may be configured. Every tool takes "
+        "an optional `site` (a site name); results then start with the site "
+        "they came from. Issue keys and URLs are routed to the right site "
+        "automatically; numeric IDs (attachments, page IDs) need `site`, and "
+        "searches use the first site unless `site` is given. whoami lists "
+        "the configured sites.\n"
+        "\n"
         "Call whoami only to debug authentication.\n"
         "\n"
         "Constraints: strictly read-only; nothing can be created, edited, "
@@ -76,24 +91,108 @@ mcp: FastMCP = FastMCP(
     ),
 )
 
-# One client per product per process, created on first use. Lazy so that
-# importing this module (e.g. in tests) needs no credentials.
-_client: JiraClient | None = None
-_confluence_client: ConfluenceClient | None = None
+# Settings and one client per product per site, created on first use. Lazy
+# so that importing this module (e.g. in tests) needs no credentials.
+_settings: Settings | None = None
+_clients: dict[str, JiraClient] = {}
+_confluence_clients: dict[str, ConfluenceClient] = {}
+# Project key -> names of the sites that have such a project.
+_project_sites: dict[str, tuple[str, ...]] = {}
 
 
-def _get_client() -> JiraClient:
-    global _client
-    if _client is None:
-        _client = JiraClient(load_settings())
-    return _client
+def _get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = load_settings()
+    return _settings
 
 
-def _get_confluence_client() -> ConfluenceClient:
-    global _confluence_client
-    if _confluence_client is None:
-        _confluence_client = ConfluenceClient(load_settings())
-    return _confluence_client
+def _get_client(site: Site) -> JiraClient:
+    if site.name not in _clients:
+        _clients[site.name] = JiraClient(_get_settings(), site=site)
+    return _clients[site.name]
+
+
+def _get_confluence_client(site: Site) -> ConfluenceClient:
+    if site.name not in _confluence_clients:
+        _confluence_clients[site.name] = ConfluenceClient(_get_settings(), site=site)
+    return _confluence_clients[site.name]
+
+
+# -- site routing ---------------------------------------------------------------
+
+
+def _resolve_site(
+    site: str | None, ref: str | int | None = None, *, by_id: bool = False
+) -> Site:
+    """Pick the site for a call: explicit `site`, else the host of a URL in
+    `ref`, else the default site. `by_id` marks lookups by a bare ID, which
+    is only unique within a site and so must not silently hit the default."""
+    settings = _get_settings()
+    if site and site.strip():
+        return find_site(settings, site)
+    if ref is not None:
+        from_url = site_from_url(settings, str(ref))
+        if from_url is not None:
+            return from_url
+    if by_id and len(settings.sites) > 1:
+        raise ValueError(
+            f"'{ref}' is an ID, which does not identify a site, and several "
+            f"sites are configured: {describe_sites(settings)}. Call again "
+            "with site= set to the site this ID came from."
+        )
+    return settings.default_site
+
+
+async def _has_project(site: Site, project: str) -> bool:
+    try:
+        await _get_client(site).get_json(f"/rest/api/3/project/{project}")
+    except AtlassianError as exc:
+        if exc.status_code != 404:
+            logger.warning(
+                "Project lookup for %s on %s failed: %s", project, site.name, exc
+            )
+        return False
+    return True
+
+
+async def _resolve_issue_site(site: str | None, issue_key: str) -> Site:
+    """Like _resolve_site, but routes an issue key by which site has its project."""
+    settings = _get_settings()
+    if (site and site.strip()) or len(settings.sites) == 1:
+        return _resolve_site(site)
+    project = normalize_issue_key(issue_key).rsplit("-", 1)[0]
+    if project not in _project_sites:
+        found = await asyncio.gather(
+            *(_has_project(s, project) for s in settings.sites)
+        )
+        names = tuple(
+            s.name for s, has in zip(settings.sites, found, strict=True) if has
+        )
+        if not names:
+            raise ValueError(
+                f"No configured site ({describe_sites(settings)}) has a Jira "
+                f"project '{project}' visible to this account. Pass site= to "
+                "query one site anyway."
+            )
+        _project_sites[project] = names
+    names = _project_sites[project]
+    if len(names) > 1:
+        raise ValueError(
+            f"Project '{project}' exists on several sites: {', '.join(names)}. "
+            "Call again with site= set to the one you mean."
+        )
+    return find_site(settings, names[0])
+
+
+def _labelled(site: Site, text: str) -> str:
+    """Prefix a result with its site, once more than one is configured."""
+    if len(_get_settings().sites) == 1:
+        return text
+    return (
+        f'**Site:** {site.name} ({site.url}); pass site="{site.name}" in '
+        f"follow-up calls about this result.\n\n{text}"
+    )
 
 
 # *all so custom fields (acceptance criteria etc.) come along; comment and
@@ -120,14 +219,13 @@ async def _fetch_comments(
 
 
 # Field-name catalog (customfield_10123 -> "Acceptance Criteria"), fetched
-# once per process. Only successful lookups are cached, so a transient
-# failure is retried on the next call.
-_field_names: dict[str, str] | None = None
+# once per site per process. Only successful lookups are cached, so a
+# transient failure is retried on the next call.
+_field_names: dict[str, dict[str, str]] = {}
 
 
 async def _get_field_names(client: JiraClient) -> dict[str, str]:
-    global _field_names
-    if _field_names is None:
+    if client.site.name not in _field_names:
         try:
             catalog = await client.get_json("/rest/api/3/field")
         except AtlassianError as exc:
@@ -135,12 +233,12 @@ async def _get_field_names(client: JiraClient) -> dict[str, str]:
                 "Field catalog unavailable; custom fields will show raw IDs: %s", exc
             )
             return {}
-        _field_names = {
+        _field_names[client.site.name] = {
             str(field["id"]): str(field.get("name") or field["id"])
             for field in catalog
             if isinstance(field, dict) and field.get("id")
         }
-    return _field_names
+    return _field_names[client.site.name]
 
 
 async def _get_issue_impl(
@@ -255,11 +353,6 @@ async def _download(client: AtlassianClient, path: str) -> bytes:
     return data
 
 
-async def _whoami_impl(client: JiraClient) -> str:
-    account = await client.get_json(MYSELF_PATH)
-    return render_myself(account, client.base_url or "?", client.used_cloud_id_fallback)
-
-
 async def _account_section(client: AtlassianClient) -> str:
     """One product's auth report; an error becomes the section's content."""
     name = client.product.name
@@ -270,7 +363,66 @@ async def _account_section(client: AtlassianClient) -> str:
     report = render_myself(
         account, client.base_url or "?", client.used_cloud_id_fallback
     )
-    return f"## {name}\n\n{report}"
+    return f"## {name}\n\n{report}\n**Token from:** {client.token_source}"
+
+
+async def _site_report(site: Site) -> str:
+    """Auth report for both products of one site. A product without a token
+    is reported as such instead of failing the other one."""
+    sections: list[str] = []
+    for name, get in (("Jira", _get_client), ("Confluence", _get_confluence_client)):
+        try:
+            client: AtlassianClient = get(site)
+        except ConfigError as exc:
+            sections.append(f"## {name}\n\n**Not configured:** {exc}")
+            continue
+        sections.append(await _account_section(client))
+    return "\n\n".join(sections)
+
+
+async def _whoami_all_sites() -> str:
+    settings = _get_settings()
+    reports = await asyncio.gather(*(_site_report(site) for site in settings.sites))
+    if len(settings.sites) == 1:
+        return reports[0]
+    return "\n\n".join(
+        f"# Site: {site.name} ({site.url})\n\n{report}"
+        for site, report in zip(settings.sites, reports, strict=True)
+    )
+
+
+async def _user_activity_all_sites(
+    site: str | None,
+    from_date: str,
+    to_date: str,
+    user: str,
+    include_confluence: bool,
+    max_issues: int,
+) -> str:
+    settings = _get_settings()
+    sites = (find_site(settings, site),) if site and site.strip() else settings.sites
+
+    async def one(target: Site) -> str:
+        return await activity.get_user_activity_impl(
+            _get_client(target),
+            (lambda: _get_confluence_client(target)) if include_confluence else None,
+            from_date,
+            to_date,
+            user,
+            max_issues,
+        )
+
+    if len(sites) == 1:
+        return _labelled(sites[0], await one(sites[0]))
+
+    async def section(target: Site) -> str:
+        try:
+            body = await one(target)
+        except (AtlassianError, ConfigError) as exc:
+            body = f"**Activity unavailable:** {exc}"
+        return f"# Site: {target.name} ({target.url})\n\n{body}"
+
+    return "\n\n".join(await asyncio.gather(*(section(s) for s in sites)))
 
 
 # -- MCP tools ------------------------------------------------------------------
@@ -278,7 +430,9 @@ async def _account_section(client: AtlassianClient) -> str:
 
 
 @mcp.tool
-async def get_issue(issue_key: str, include_comments: bool = True) -> str:
+async def get_issue(
+    issue_key: str, include_comments: bool = True, site: str | None = None
+) -> str:
     """Get full detail for one Jira issue as Markdown.
 
     Returns summary, status, type, priority, resolution, assignee, reporter,
@@ -293,19 +447,28 @@ async def get_issue(issue_key: str, include_comments: bool = True) -> str:
             whitespace are tolerated).
         include_comments: Set False to omit the comment thread when only the
             ticket body is needed — the response is much shorter.
+        site: Only with several configured sites: the site name. Optional
+            here, the issue key's project identifies the site.
 
     Prefer get_issue_context when the goal is discovering *related* tickets
     rather than reading this one.
     """
     try:
-        return await _get_issue_impl(_get_client(), issue_key, include_comments)
+        target = await _resolve_issue_site(site, issue_key)
+        return _labelled(
+            target,
+            await _get_issue_impl(_get_client(target), issue_key, include_comments),
+        )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
 async def get_comments(
-    issue_key: str, limit: int = 100, newest_first: bool = False
+    issue_key: str,
+    limit: int = 100,
+    newest_first: bool = False,
+    site: str | None = None,
 ) -> str:
     """Get only the comment thread of a Jira issue, as Markdown.
 
@@ -318,18 +481,20 @@ async def get_comments(
         limit: Maximum number of comments to return (1-100).
         newest_first: Set True to get the most recent comments first —
             useful for long threads where only the latest state matters.
+        site: Only with several configured sites: the site name. Optional
+            here, the issue key's project identifies the site.
     """
     try:
-        client = _get_client()
         key = normalize_issue_key(issue_key)
-        comments = await _fetch_comments(client, key, limit, newest_first)
-        return render_comments(comments)
+        target = await _resolve_issue_site(site, key)
+        comments = await _fetch_comments(_get_client(target), key, limit, newest_first)
+        return _labelled(target, render_comments(comments))
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def get_issue_context(issue_key: str) -> str:
+async def get_issue_context(issue_key: str, site: str | None = None) -> str:
     """Map the reference graph around a Jira issue: parent, subtasks, links.
 
     Returns the parent (e.g. epic), all subtasks, and all linked issues —
@@ -340,18 +505,23 @@ async def get_issue_context(issue_key: str) -> str:
 
     Args:
         issue_key: Jira issue key like "PROJ-123".
+        site: Only with several configured sites: the site name. Optional
+            here, the issue key's project identifies the site.
 
     Use this first when exploring an unfamiliar ticket; then get_issue on
     the keys that look relevant.
     """
     try:
-        return await _get_issue_context_impl(_get_client(), issue_key)
+        target = await _resolve_issue_site(site, issue_key)
+        return _labelled(
+            target, await _get_issue_context_impl(_get_client(target), issue_key)
+        )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def search_issues(jql: str, limit: int = 25) -> str:
+async def search_issues(jql: str, limit: int = 25, site: str | None = None) -> str:
     """Search Jira with a JQL query; returns a compact Markdown list.
 
     Each result line has key, type, status, summary, assignee and last
@@ -362,9 +532,14 @@ async def search_issues(jql: str, limit: int = 25) -> str:
     Args:
         jql: A JQL query string (sent via POST, so any length/complexity works).
         limit: Maximum number of issues to return.
+        site: Only with several configured sites: the site name to search.
+            Defaults to the first configured site.
     """
     try:
-        return await _search_issues_impl(_get_client(), jql, limit)
+        target = _resolve_site(site)
+        return _labelled(
+            target, await _search_issues_impl(_get_client(target), jql, limit)
+        )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
@@ -376,6 +551,7 @@ async def get_user_activity(
     user: str = "me",
     include_confluence: bool = False,
     max_issues: int = 50,
+    site: str | None = None,
 ) -> str:
     """What a user did in Jira (optionally Confluence) between two dates.
 
@@ -390,26 +566,25 @@ async def get_user_activity(
         user: "me" or an Atlassian accountId.
         include_confluence: Also list Confluence pages the user contributed
             to that were modified in the range.
-        max_issues: Maximum issues to inspect (1-100).
+        max_issues: Maximum issues to inspect (1-100), per site.
+        site: Only with several configured sites: restrict to one site name.
+            By default every site is reported, one section each.
 
     Example: get_user_activity(from_date="2026-10-30", to_date="2026-10-31")
     for everything I did on 30 Oct 2026.
     """
     try:
-        return await activity.get_user_activity_impl(
-            _get_client(),
-            _get_confluence_client if include_confluence else None,
-            from_date,
-            to_date,
-            user,
-            max_issues,
+        return await _user_activity_all_sites(
+            site, from_date, to_date, user, include_confluence, max_issues
         )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def get_attachment(attachment_id: str | int) -> Image | str:
+async def get_attachment(
+    attachment_id: str | int, site: str | None = None
+) -> Image | str:
     """Download an image or text file attached to a Jira issue.
 
     Images are returned as images so they can be looked at directly, e.g. a
@@ -429,15 +604,20 @@ async def get_attachment(attachment_id: str | int) -> Image | str:
         attachment_id: The numeric attachment ID exactly as listed in
             get_issue output, e.g. get_attachment(attachment_id="107474").
             NOT the issue key and NOT the filename.
+        site: Only with several configured sites: the site name shown at
+            the top of the result this ID came from. Required then.
     """
     try:
-        return await _get_attachment_impl(_get_client(), attachment_id)
+        target = _resolve_site(site, attachment_id, by_id=True)
+        return await _get_attachment_impl(_get_client(target), attachment_id)
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def get_confluence_page(page: str | int, include_comments: bool = True) -> str:
+async def get_confluence_page(
+    page: str | int, include_comments: bool = True, site: str | None = None
+) -> str:
     """Get a Confluence page or blog post as Markdown.
 
     Returns title, space, version, author/owner, last edit, labels, URL, the
@@ -453,10 +633,16 @@ async def get_confluence_page(page: str | int, include_comments: bool = True) ->
             Blog post URLs work too.
         include_comments: Set False to omit comments when only the page body
             is needed — the response is much shorter.
+        site: Only with several configured sites: the site name. Optional
+            for a URL (its host identifies the site), required for a bare ID.
     """
     try:
-        return await confluence.get_page_impl(
-            _get_confluence_client(), page, include_comments
+        target = _resolve_site(site, page, by_id=True)
+        return _labelled(
+            target,
+            await confluence.get_page_impl(
+                _get_confluence_client(target), page, include_comments
+            ),
         )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
@@ -464,7 +650,10 @@ async def get_confluence_page(page: str | int, include_comments: bool = True) ->
 
 @mcp.tool
 async def get_confluence_comments(
-    page: str | int, limit: int = 100, newest_first: bool = False
+    page: str | int,
+    limit: int = 100,
+    newest_first: bool = False,
+    site: str | None = None,
 ) -> str:
     """Get only the comments on a Confluence page or blog post, as Markdown.
 
@@ -479,17 +668,23 @@ async def get_confluence_comments(
         newest_first: Set True to get the most recent comments first —
             useful for long discussions where only the latest state
             matters. Replies within a thread stay in chronological order.
+        site: Only with several configured sites: the site name. Optional
+            for a URL (its host identifies the site), required for a bare ID.
     """
     try:
-        return await confluence.get_comments_impl(
-            _get_confluence_client(), page, limit, newest_first
+        target = _resolve_site(site, page, by_id=True)
+        return _labelled(
+            target,
+            await confluence.get_comments_impl(
+                _get_confluence_client(target), page, limit, newest_first
+            ),
         )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def get_confluence_page_context(page: str | int) -> str:
+async def get_confluence_page_context(page: str | int, site: str | None = None) -> str:
     """Map where a Confluence page sits in its space's page tree.
 
     Returns the space, the ancestor chain (top-level first) and the direct
@@ -498,18 +693,28 @@ async def get_confluence_page_context(page: str | int) -> str:
 
     Args:
         page: A numeric page ID or a Confluence page URL.
+        site: Only with several configured sites: the site name. Optional
+            for a URL (its host identifies the site), required for a bare ID.
 
     Use this to find parent overviews or sibling specs; then
     get_confluence_page on the IDs that look relevant.
     """
     try:
-        return await confluence.get_page_context_impl(_get_confluence_client(), page)
+        target = _resolve_site(site, page, by_id=True)
+        return _labelled(
+            target,
+            await confluence.get_page_context_impl(
+                _get_confluence_client(target), page
+            ),
+        )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def search_confluence(query: str, limit: int = 25) -> str:
+async def search_confluence(
+    query: str, limit: int = 25, site: str | None = None
+) -> str:
     """Search Confluence; returns a compact Markdown list with excerpts.
 
     Plain words (e.g. "payment retry design") run a full-text search over
@@ -521,15 +726,23 @@ async def search_confluence(query: str, limit: int = 25) -> str:
     Args:
         query: Search words or a CQL query.
         limit: Maximum number of results (1-100).
+        site: Only with several configured sites: the site name to search.
+            Defaults to the first configured site.
     """
     try:
-        return await confluence.search_impl(_get_confluence_client(), query, limit)
+        target = _resolve_site(site)
+        return _labelled(
+            target,
+            await confluence.search_impl(_get_confluence_client(target), query, limit),
+        )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
 @mcp.tool
-async def get_confluence_attachment(attachment_id: str | int) -> Image | str:
+async def get_confluence_attachment(
+    attachment_id: str | int, site: str | None = None
+) -> Image | str:
     """Download a file attached to a Confluence page or comment.
 
     Images (png, jpeg, gif, webp) come back as the image itself, for visual
@@ -544,10 +757,13 @@ async def get_confluence_attachment(attachment_id: str | int) -> Image | str:
             or shown next to an image in a comment, e.g. "[attachment:
             bug.png, id att123456]" -> get_confluence_attachment(
             attachment_id="att123456"). NOT the page ID and NOT the filename.
+        site: Only with several configured sites: the site name shown at
+            the top of the result this ID came from. Required then.
     """
     try:
+        target = _resolve_site(site, attachment_id, by_id=True)
         return await confluence.get_attachment_impl(
-            _get_confluence_client(), attachment_id
+            _get_confluence_client(target), attachment_id
         )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
@@ -557,62 +773,56 @@ async def get_confluence_attachment(attachment_id: str | int) -> Image | str:
 async def whoami() -> str:
     """Report which Atlassian account this server is authenticated as.
 
-    Covers Jira and Confluence separately (they may use different tokens):
-    display name, email, account ID, and which base URL was selected (site
-    URL vs cloud-ID fallback). Call this first when any other tool returns
+    Covers every configured site, and Jira and Confluence separately (they
+    may use different tokens): display name, email, account ID, which base
+    URL was selected (site URL vs cloud-ID fallback) and which environment
+    variable the token came from. Call this first when any other tool returns
     authentication or permission errors — it isolates whether the problem
     is the credentials or the specific resource.
     """
     try:
-        sections = await asyncio.gather(
-            _account_section(_get_client()),
-            _account_section(_get_confluence_client()),
-        )
+        return await _whoami_all_sites()
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
-    return "\n\n".join(sections)
 
 
 # -- --check mode ----------------------------------------------------------------
 
 
-async def _run_check(issue_key: str | None, page: str | None) -> int:
+async def _run_check(issue_key: str | None, page: str | None, site: str | None) -> int:
     """Diagnostic mode for terminals and the PyCharm debugger.
 
     Runs entirely outside MCP, so printing to stdout is safe here.
     """
     print(f".env file: {'found' if ENV_FILE.is_file() else 'NOT found'} at {ENV_FILE}")
     try:
-        settings: Settings = load_settings()
+        settings = _get_settings()
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}")
         return 1
-    print(f"Site URL: {settings.site_url}")
+    print(f"Sites (first is the default): {describe_sites(settings)}")
     print(f"Cloud ID override: {settings.cloud_id or '(not set — auto-detect)'}")
-    separate_token = "yes" if settings.confluence_api_token else "no (shared token)"
-    print(f"Separate Confluence token: {separate_token}")
 
-    jira = JiraClient(settings)
-    wiki = ConfluenceClient(settings)
     try:
-        print(f"\n{await _account_section(jira)}")
-        print(f"\n{await _account_section(wiki)}")
+        print(f"\n{await _whoami_all_sites()}")
         if issue_key:
-            print(f"\n--- {issue_key} ---\n")
+            jira = _get_client(await _resolve_issue_site(site, issue_key))
+            print(f"\n--- {issue_key} ({jira.site.name}) ---\n")
             print(await _get_issue_impl(jira, issue_key, include_comments=True))
             print("\n--- context ---\n")
             print(await _get_issue_context_impl(jira, issue_key))
         if page:
-            print(f"\n--- Confluence {page} ---\n")
+            wiki = _get_confluence_client(_resolve_site(site, page, by_id=True))
+            print(f"\n--- Confluence {page} ({wiki.site.name}) ---\n")
             print(await confluence.get_page_impl(wiki, page, include_comments=True))
             print("\n--- page context ---\n")
             print(await confluence.get_page_context_impl(wiki, page))
-    except (AtlassianError, ValueError) as exc:
+    except (AtlassianError, ConfigError, ValueError) as exc:
         print(f"ERROR: {exc}")
         return 1
     finally:
-        await jira.aclose()
-        await wiki.aclose()
+        for client in (*_clients.values(), *_confluence_clients.values()):
+            await client.aclose()
     print("\nAll requested checks ran (see sections above for per-product status).")
     return 0
 
@@ -644,25 +854,43 @@ def main() -> None:
         metavar="PAGE",
         help="With --check: also fetch this Confluence page ID or URL in full.",
     )
+    parser.add_argument(
+        "--site",
+        default=None,
+        metavar="SITE",
+        help="With --check: the site name for ISSUE_KEY/PAGE when several are configured.",
+    )
     args = parser.parse_args()
 
     if args.check is not None or args.page:
         # asyncio.run() creates an event loop, runs one coroutine, and cleans
         # up — the standard way to call async code from a sync entry point.
-        sys.exit(asyncio.run(_run_check(args.check or None, args.page)))
+        sys.exit(asyncio.run(_run_check(args.check or None, args.page, args.site)))
 
     _register_writes()
     mcp.run()  # stdio transport is FastMCP's default
 
 
-_write_client: JiraWriteClient | None = None
+_write_clients: dict[str, JiraWriteClient] = {}
 
 
-def _get_write_client() -> JiraWriteClient:
-    global _write_client
-    if _write_client is None:
-        _write_client = JiraWriteClient(load_settings())
-    return _write_client
+def _get_write_client(site: Site) -> JiraWriteClient:
+    if site.name not in _write_clients:
+        _write_clients[site.name] = JiraWriteClient(_get_settings(), site=site)
+    return _write_clients[site.name]
+
+
+async def _write_client_for(
+    site: str | None,
+    *,
+    issue_key: str | None = None,
+    link_id: str | int | None = None,
+) -> JiraWriteClient:
+    """Route a write like a read: by the issue key's project, else by `site`
+    (required for a bare link ID once several sites are configured)."""
+    if issue_key is not None:
+        return _get_write_client(await _resolve_issue_site(site, issue_key))
+    return _get_write_client(_resolve_site(site, link_id, by_id=True))
 
 
 def _register_writes() -> None:
@@ -674,7 +902,7 @@ def _register_writes() -> None:
         if settings.jira_write_api_token:
             logger.warning("Jira writes stay disabled: JIRA_WRITE_PROJECTS is not set.")
         return
-    writes.register(mcp, _get_write_client)
+    writes.register(mcp, _write_client_for, settings.jira_write_projects)
     logger.info(
         "Jira writes enabled for projects: %s",
         ", ".join(sorted(settings.jira_write_projects)),

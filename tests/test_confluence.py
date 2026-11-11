@@ -11,7 +11,7 @@ from fastmcp.utilities.types import Image
 
 from jira_mcp import confluence
 from jira_mcp.client import AtlassianError, ConfluenceClient, ReadOnlyViolationError
-from jira_mcp.config import Settings
+from jira_mcp.config import Settings, parse_sites
 from jira_mcp.confluence_render import normalize_attachment_id, parse_page_ref
 
 SITE = "https://example.atlassian.net"
@@ -36,7 +36,7 @@ def settings(confluence_token: str | None = None) -> Settings:
     return Settings(
         email="ada@x.io",
         api_token="jira-secret",
-        site_url=SITE,
+        sites=parse_sites(SITE),
         cloud_id=None,
         env_file_found=True,
         confluence_api_token=confluence_token,
@@ -227,8 +227,11 @@ def test_to_cql_passes_cql_through() -> None:
 
 
 def test_confluence_token_falls_back_to_shared_token() -> None:
-    assert settings().confluence_token == "jira-secret"
-    assert settings("wiki-secret").confluence_token == "wiki-secret"
+    assert settings().confluence_token == ("jira-secret", "ATLASSIAN_API_TOKEN")
+    assert settings("wiki-secret").confluence_token == (
+        "wiki-secret",
+        "CONFLUENCE_API_TOKEN",
+    )
 
 
 # -- client -------------------------------------------------------------------

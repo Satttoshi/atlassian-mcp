@@ -9,7 +9,7 @@ import pytest
 
 from jira_mcp import activity, server
 from jira_mcp.client import ConfluenceClient, JiraClient
-from jira_mcp.config import ConfigError, Settings
+from jira_mcp.config import ConfigError, Settings, Site, parse_sites
 
 SITE = "https://example.atlassian.net"
 ME = {"accountId": "me-1", "displayName": "Ada", "timeZone": "Europe/Berlin"}
@@ -27,7 +27,7 @@ def settings() -> Settings:
     return Settings(
         email="ada@x.io",
         api_token="secret",
-        site_url=SITE,
+        sites=parse_sites(SITE),
         cloud_id=None,
         env_file_found=True,
     )
@@ -299,11 +299,12 @@ async def test_issue_without_extracted_events_is_listed_as_quiet() -> None:
 async def test_confluence_off_never_touches_confluence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def explode() -> ConfluenceClient:
+    def explode(site: Site) -> ConfluenceClient:
         raise AssertionError("Confluence must not be touched")
 
     client = make_client(Handler(issues=[]))
-    monkeypatch.setattr(server, "_get_client", lambda: client)
+    monkeypatch.setattr(server, "_settings", settings())
+    monkeypatch.setattr(server, "_get_client", lambda site: client)
     monkeypatch.setattr(server, "_get_confluence_client", explode)
     output = await server.get_user_activity("2026-10-30", "2026-10-31")
     assert "## Confluence" not in output

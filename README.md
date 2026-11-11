@@ -48,14 +48,17 @@ transitions, deletes, or comments on anything. Enforcement is layered:
 
 | Tool | Purpose |
 |---|---|
-| `whoami()` | Which account each product's token resolves to (Jira and Confluence reported separately); the first stop for auth debugging |
+| `whoami()` | Which account each product's token resolves to, per configured site (Jira and Confluence reported separately), and which environment variable each token came from; the first stop for auth debugging |
+
+Every tool except `whoami` also takes an optional `site` argument; see
+[Multiple sites](#multiple-sites).
 
 ## Optional: Jira writes
 
 Off by default. To turn them on, set in `.env`:
 
 - `JIRA_WRITE_PROJECTS`: comma-separated project keys the write tools may touch, e.g. `AC`. Required.
-- `JIRA_WRITE_API_TOKEN`: optional. Without it the writes use `ATLASSIAN_API_TOKEN`, which then needs `write:jira-work` (an unscoped token has it). Set a separate token with `read:jira-work`, `write:jira-work` and `read:jira-user` to keep the read token read-only.
+- `JIRA_WRITE_API_TOKEN`: optional. Without it the writes use the Jira token (`JIRA_API_TOKEN`, else `ATLASSIAN_API_TOKEN`), which then needs `write:jira-work` (an unscoped token has it). Set a separate token with `read:jira-work`, `write:jira-work` and `read:jira-user` to keep the read token read-only.
 
 Then restart the MCP server (start a new Claude Code session). The startup log says "Jira writes enabled for projects: …".
 
@@ -70,6 +73,8 @@ Then restart the MCP server (start a new Claude Code session). The startup log s
 
 Text is Jira wiki markup (REST v2), not Markdown.
 
+With several sites configured, every write tool takes the same optional `site` argument as the read tools: issue keys and the project of `create_issue` are routed to the site that has the project, and `unlink_issues` needs `site` because a link ID does not identify a site. `JIRA_WRITE_PROJECTS` applies to every site.
+
 Guard rails, all in `JiraWriteClient` (`client.py`):
 
 1. Only the routes in `WRITE_ROUTES` are allowed. Nothing can be deleted except an issue link; issues, comments and attachments can't.
@@ -79,23 +84,41 @@ Guard rails, all in `JiraWriteClient` (`client.py`):
 
 ## Setup
 
-### 1. Create an Atlassian API token
+### 1. Create Atlassian API tokens
 
-1. Go to <https://id.atlassian.com/manage-profile/security/api-tokens>.
-2. Choose **Create API token with scopes** (Atlassian is deprecating unscoped tokens).
-3. Select the **Jira** app and pick **only** these scopes:
+Tokens are created at <https://id.atlassian.com/manage-profile/security/api-tokens>
+and belong to your account, so the same tokens work for every site you configure.
+Pick one of two setups:
+
+| Setup | Variables | Read-only enforced by |
+|---|---|---|
+| **Scoped tokens** (recommended) | `JIRA_API_TOKEN` and/or `CONFLUENCE_API_TOKEN` | Atlassian and this server |
+| **One unscoped token** (simplest) | `ATLASSIAN_API_TOKEN` | this server only |
+
+A scoped token is bound to **one** app, which is why the scoped setup needs one
+token per product. Setting only one of the two is fine: the other product's tools
+then report that no token is configured.
+
+**Scoped tokens:**
+
+1. Choose **Create API token with scopes**.
+2. Select the **Jira** app and pick **only** these scopes:
    - `read:jira-work`
    - `read:jira-user`
-4. Copy the token immediately; it is shown only once.
+3. Copy the token immediately (it is shown only once) into `JIRA_API_TOKEN`.
+4. For Confluence, repeat with the **Confluence** app and the scopes below, and put
+   that token in `CONFLUENCE_API_TOKEN`.
 
-An older *unscoped* token also works for **both** Jira and Confluence; the server
-handles both kinds automatically (see below).
+**One unscoped token:** choose **Create API token** and put it in
+`ATLASSIAN_API_TOKEN`. It works for both products, but it can do everything your
+account can, so read-only then rests on this server's request guard alone.
+
+Each product uses its own variable if set and falls back to `ATLASSIAN_API_TOKEN`
+otherwise. The server handles both token kinds automatically (see below).
 
 #### Confluence token scopes
 
-A scoped token is bound to **one** app, so with scoped tokens Confluence needs a
-second token: repeat the steps above, select the **Confluence** app, and put that
-token in `CONFLUENCE_API_TOKEN`. Select only read scopes:
+Select only read scopes:
 
 - `read:page:confluence`, `read:blogpost:confluence`: page and blog post bodies
 - `read:comment:confluence`: footer and inline comments
@@ -107,22 +130,23 @@ token in `CONFLUENCE_API_TOKEN`. Select only read scopes:
 - `search:confluence`: CQL search (if search returns 403, also add
   `read:content-details:confluence`)
 
-If you use one unscoped token, leave `CONFLUENCE_API_TOKEN` unset.
-
 ### 2. Configure `.env`
 
 ```bash
 cp .env.example .env   # then edit
 ```
 
-Required keys (this is the whole configuration surface):
+This is the whole configuration surface:
 
 | Key | Value |
 |---|---|
 | `ATLASSIAN_EMAIL` | The email of your Atlassian account |
-| `ATLASSIAN_API_TOKEN` | The token from step 1 |
-| `ATLASSIAN_SITE_URL` | e.g. `https://your-company.atlassian.net` (shared by Jira and Confluence) |
-| `CONFLUENCE_API_TOKEN` | *Optional.* A separate Confluence token (needed for scoped tokens; see above). Falls back to `ATLASSIAN_API_TOKEN` |
+| `ATLASSIAN_SITE_URL` | e.g. `https://your-company.atlassian.net` (shared by Jira and Confluence). Several sites: separate them with commas; see [Multiple sites](#multiple-sites) |
+| `ATLASSIAN_API_TOKEN` | One unscoped token for both products (setup 2 in step 1) |
+| `JIRA_API_TOKEN` | A Jira-scoped token; wins over `ATLASSIAN_API_TOKEN` for Jira |
+| `CONFLUENCE_API_TOKEN` | A Confluence-scoped token; wins over `ATLASSIAN_API_TOKEN` for Confluence |
+
+The email, the site URL and at least one token are required.
 
 `.env` is gitignored; never commit it. Real environment variables take precedence
 over the file. The file is located relative to the project directory (not the working
@@ -151,10 +175,39 @@ python -m venv .venv
 .venv/bin/python -m jira_mcp --check --page 123456   # also fetch a Confluence page
 ```
 
-This prints whether `.env` was found, which base URL was selected for each product
-(and whether the cloud-ID fallback was needed), the authenticated account, and, when
-a key or page is given, the content exactly as Claude would see it. `--page` accepts a
-numeric page ID or a full page URL.
+This prints whether `.env` was found, the configured sites, and for each site and
+product: which base URL was selected (and whether the cloud-ID fallback was needed),
+the authenticated account and the variable its token came from. When a key or page is
+given, it also prints the content exactly as Claude would see it. `--page` accepts a
+numeric page ID or a full page URL; with several sites, add `--site NAME` for a
+numeric page ID.
+
+## Multiple sites
+
+If your account belongs to several Atlassian sites (orgs), list them all:
+
+```
+ATLASSIAN_SITE_URL=https://acme.atlassian.net,https://other-org.atlassian.net
+```
+
+Each site is named after its subdomain (`acme`, `other-org`; a custom domain keeps
+its full hostname) and the first one is the default. The same email and tokens are
+used for all of them. With more than one site configured:
+
+- Every result starts with a `Site:` line, and every tool accepts `site="<name>"`.
+- **Issue keys** are routed automatically: the server checks which site has the
+  key's project (one request per site, cached per project). If the project exists
+  on several sites, or on none, the tool returns an error asking for `site` instead
+  of guessing.
+- **URLs** (Confluence pages) are routed by their hostname.
+- **Bare IDs** (attachment IDs, numeric page IDs) are only unique within a site, so
+  they require `site`.
+- **Searches** (`search_issues`, `search_confluence`) run on the default site unless
+  `site` is given.
+- **`get_user_activity`** reports every site, one section each, unless `site` is
+  given.
+
+`ATLASSIAN_CLOUD_ID` identifies one site, so it cannot be combined with several.
 
 ## Scoped vs. unscoped tokens: the base URL problem
 
@@ -227,7 +280,9 @@ Inside a Claude Code session:
 |---|---|
 | **401 Unauthorized** | Wrong email or token, or the token was revoked/expired. Recreate the token and update `.env`. Run `--check` to confirm. |
 | **403 Forbidden** | Scoped token missing `read:jira-work` / `read:jira-user`, or your account lacks site access. Recreate the token with both read scopes. |
-| **Confluence 401/403 but Jira works** | With scoped tokens, the Jira token cannot read Confluence. Create a Confluence-scoped token and set `CONFLUENCE_API_TOKEN`. `whoami` shows each product's status separately. |
+| **Confluence 401/403 but Jira works** | With scoped tokens, the Jira token cannot read Confluence. Create a Confluence-scoped token and set `CONFLUENCE_API_TOKEN`. `whoami` shows each product's status and token variable separately. |
+| **"No API token configured for ..."** | That product has neither its own token variable nor `ATLASSIAN_API_TOKEN`. Set one of the two named in the error. |
+| **"exists on several sites" / "is an ID, which does not identify a site"** | Several sites are configured and the input does not pin one down. Pass `site` (the name from `whoami` or from the `Site:` line of an earlier result). |
 | **404 Not Found** | The issue or page doesn't exist, **or your account lacks permission to see it**. Jira reports issues you cannot view as 404, and a token never grants more access than the human it belongs to. Verify you can open the ticket in a browser while logged in as that account. |
 | **Empty tool list in Claude** | The server crashed at startup. Run the exact command from `claude mcp add` yourself in a terminal; startup errors print to stderr. Usual causes: wrong Python path, or missing `.env` keys. |
 | **"short link" error for a Confluence URL** | `/wiki/x/…` short links can't be resolved without a browser. Open the link and pass the full page URL (or the numeric ID from it). |

@@ -55,7 +55,8 @@ T = TypeVar("T")
 
 # Per-process caches; only successful lookups are stored.
 _user_names: dict[str, str] = {}
-_spaces: dict[str, dict[str, Any]] = {}
+# Space IDs are only unique within a site.
+_spaces: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 async def _gather_limited(awaitables: Iterable[Awaitable[T]]) -> list[T]:
@@ -135,12 +136,12 @@ async def resolve_users(
 async def get_space(client: ConfluenceClient, space_id: Any) -> dict[str, Any] | None:
     if not space_id:
         return None
-    key = str(space_id)
+    key = (client.site.name, str(space_id))
     if key not in _spaces:
         try:
-            _spaces[key] = await client.get_json(f"{V2}/spaces/{key}")
+            _spaces[key] = await client.get_json(f"{V2}/spaces/{space_id}")
         except AtlassianError as exc:
-            logger.warning("Could not fetch Confluence space %s: %s", key, exc)
+            logger.warning("Could not fetch Confluence space %s: %s", space_id, exc)
             return None
     return _spaces[key]
 
