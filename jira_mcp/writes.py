@@ -1,6 +1,6 @@
 """Opt-in Jira write tools.
 
-Registered only when JIRA_WRITE_API_TOKEN and JIRA_WRITE_PROJECTS are set.
+Registered only when JIRA_WRITE_PROJECTS is set; JIRA_WRITE_API_TOKEN is optional.
 Text goes through REST v2, so descriptions and comments are Jira wiki markup,
 not Markdown or ADF.
 """
