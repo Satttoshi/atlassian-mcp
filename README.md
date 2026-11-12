@@ -1,4 +1,4 @@
-# Jira & Confluence MCP Server (read-only)
+# Jira & Confluence MCP Server (read-only, optional Jira writes)
 
 A local [MCP](https://modelcontextprotocol.io) server that lets Claude Code pull Jira
 ticket context (issue details, comment threads, the reference graph around a ticket,
@@ -10,7 +10,7 @@ in a spec page) can be fetched for Claude to analyze visually, and text attachme
 
 ## What it deliberately cannot do
 
-This server is **strictly read-only**. It exposes no tool that creates, updates,
+By default this server is **strictly read-only** (Jira writes are an opt-in, see "Optional: Jira writes"; Confluence is always read-only). It exposes no tool that creates, updates,
 transitions, deletes, or comments on anything. Enforcement is layered:
 
 1. **In code:** every HTTP request (Jira and Confluence) funnels through a single
@@ -49,6 +49,33 @@ transitions, deletes, or comments on anything. Enforcement is layered:
 | Tool | Purpose |
 |---|---|
 | `whoami()` | Which account each product's token resolves to (Jira and Confluence reported separately); the first stop for auth debugging |
+
+## Optional: Jira writes
+
+Off by default. To turn them on, set in `.env`:
+
+- `JIRA_WRITE_PROJECTS`: comma-separated project keys the write tools may touch, e.g. `AC`. Required.
+- `JIRA_WRITE_API_TOKEN`: optional. Without it the writes use `ATLASSIAN_API_TOKEN`, which then needs `write:jira-work` (an unscoped token has it). Set a separate token with `read:jira-work`, `write:jira-work` and `read:jira-user` to keep the read token read-only.
+
+Then restart the MCP server (start a new Claude Code session). The startup log says "Jira writes enabled for projects: …".
+
+| Tool | Purpose |
+|---|---|
+| `update_issue(issue_key, summary, description, assignee, labels, fields)` | Change only the passed fields. `fields` takes display names or IDs, e.g. `{"Acceptance Criteria": "...", "Epic Link": "AC-38"}`. `assignee="none"` unassigns |
+| `create_issue(project, summary, description, issue_type, parent, assignee, fields)` | Create an issue, returns the key |
+| `add_comment(issue_key, body)` / `edit_comment(issue_key, comment_id, body)` | Comment IDs show as `(comment 12345)` in `get_issue` |
+| `transition_issue(issue_key, status)` | Move to a status; the error lists the possible ones |
+| `link_issues(issue_key, relation, other_key)` | e.g. `("AC-66", "is blocked by", "AC-14")`; the link is read back to check its direction |
+| `unlink_issues(link_id)` | Link IDs show as `(link 12345)` in `get_issue_context` |
+
+Text is Jira wiki markup (REST v2), not Markdown.
+
+Guard rails, all in `JiraWriteClient` (`client.py`):
+
+1. Only the routes in `WRITE_ROUTES` are allowed. Nothing can be deleted except an issue link; issues, comments and attachments can't.
+2. Every write is checked against `JIRA_WRITE_PROJECTS`, including the project in a create and both issues of a link.
+3. The read client (`JiraClient`) is unchanged and still blocks every write. Confluence stays read-only.
+4. Claude Code asks before each tool call unless you allow the tool in your permissions.
 
 ## Setup
 

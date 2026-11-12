@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -151,12 +152,7 @@ class AtlassianClient:
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         method = method.upper()
-        allowed_posts = self.product.allowed_post_paths
-        if method != "GET" and not (method == "POST" and path in allowed_posts):
-            raise ReadOnlyViolationError(
-                f"Blocked {method} {path}: this server is strictly read-only. "
-                f"Only GET requests are permitted, plus POST to {sorted(allowed_posts)}."
-            )
+        self._check_allowed(method, path, json_body)
         base = await self._ensure_base_url()
         for attempt in range(MAX_RETRIES + 1):
             response = await self._http.request(
@@ -171,6 +167,16 @@ class AtlassianClient:
             await asyncio.sleep(delay)
         self._raise_for_status(response, path)
         return response
+
+    def _check_allowed(
+        self, method: str, path: str, json_body: dict[str, Any] | None
+    ) -> None:
+        allowed_posts = self.product.allowed_post_paths
+        if method != "GET" and not (method == "POST" and path in allowed_posts):
+            raise ReadOnlyViolationError(
+                f"Blocked {method} {path}: this server is strictly read-only. "
+                f"Only GET requests are permitted, plus POST to {sorted(allowed_posts)}."
+            )
 
     # -- base URL detection ----------------------------------------------------
 
@@ -345,3 +351,103 @@ class ConfluenceClient(AtlassianClient):
         self, settings: Settings, http: httpx.AsyncClient | None = None
     ) -> None:
         super().__init__(settings, CONFLUENCE, settings.confluence_token, http)
+
+
+JIRA_WRITE = Product(
+    name="Jira (write)",
+    gateway="jira",
+    probe_path=MYSELF_PATH,
+    token_env="JIRA_WRITE_API_TOKEN (or ATLASSIAN_API_TOKEN)",
+    scopes="read:jira-work, write:jira-work and read:jira-user",
+    not_found_hint="Jira reports issues you cannot view as 404",
+    allowed_post_paths=frozenset({"/rest/api/3/search/jql"}),
+)
+
+_KEY = r"(?P<key>[A-Z][A-Z0-9_]*-\d+)"
+
+# The complete list of writes. No DELETE except removing an issue link, so an
+# issue, comment or attachment can never be deleted through this server.
+WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/rest/api/2/issue$")),
+    ("PUT", re.compile(rf"^/rest/api/2/issue/{_KEY}$")),
+    ("POST", re.compile(rf"^/rest/api/2/issue/{_KEY}/comment$")),
+    ("PUT", re.compile(rf"^/rest/api/2/issue/{_KEY}/comment/\d+$")),
+    ("POST", re.compile(rf"^/rest/api/2/issue/{_KEY}/transitions$")),
+    ("POST", re.compile(r"^/rest/api/2/issueLink$")),
+    ("DELETE", re.compile(r"^/rest/api/2/issueLink/\d+$")),
+)
+
+
+class WriteNotAllowedError(ReadOnlyViolationError):
+    """A write outside the allowed routes or the allowed projects."""
+
+
+def project_of(issue_key: str) -> str:
+    return issue_key.rsplit("-", 1)[0].upper()
+
+
+class JiraWriteClient(AtlassianClient):
+    """Jira client for the opt-in write tools.
+
+    Every write is checked against WRITE_ROUTES and JIRA_WRITE_PROJECTS before
+    it is sent. Removing a link (DELETE issueLink) can't be checked here, since
+    the path has no issue key: callers must check the linked issues first.
+    """
+
+    def __init__(
+        self, settings: Settings, http: httpx.AsyncClient | None = None
+    ) -> None:
+        if not settings.writes_enabled:
+            raise WriteNotAllowedError(
+                "Jira writes are disabled: set JIRA_WRITE_PROJECTS in .env."
+            )
+        super().__init__(settings, JIRA_WRITE, settings.write_token, http)
+        self.projects = settings.jira_write_projects
+
+    def require_project(self, issue_key: str) -> None:
+        project = project_of(issue_key)
+        if project not in self.projects:
+            raise WriteNotAllowedError(
+                f"Blocked write to {issue_key}: project {project} is not in "
+                f"JIRA_WRITE_PROJECTS ({', '.join(sorted(self.projects))})."
+            )
+
+    async def send(
+        self, method: str, path: str, json_body: dict[str, Any] | None = None
+    ) -> Any:
+        response = await self._request(method, path, json_body=json_body)
+        if response.status_code == 204 or not response.content:
+            return None
+        return response.json()
+
+    def _check_allowed(
+        self, method: str, path: str, json_body: dict[str, Any] | None
+    ) -> None:
+        if method == "GET" or (
+            method == "POST" and path in self.product.allowed_post_paths
+        ):
+            return
+        for route_method, pattern in WRITE_ROUTES:
+            match = pattern.match(path)
+            if route_method == method and match:
+                break
+        else:
+            raise WriteNotAllowedError(
+                f"Blocked {method} {path}: not an allowed write."
+            )
+        if "key" in match.groupdict():
+            self.require_project(match["key"])
+        for key in _body_issue_keys(path, json_body or {}):
+            self.require_project(key)
+
+
+def _body_issue_keys(path: str, body: dict[str, Any]) -> list[str]:
+    if path == "/rest/api/2/issue":
+        project = (body.get("fields") or {}).get("project") or {}
+        return [f"{project.get('key', '')}-0"]
+    if path == "/rest/api/2/issueLink":
+        return [
+            str((body.get(side) or {}).get("key", ""))
+            for side in ("inwardIssue", "outwardIssue")
+        ]
+    return []

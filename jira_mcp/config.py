@@ -35,10 +35,26 @@ class Settings:
     env_file_found: bool
     # Scoped tokens are bound to one app, so Confluence may need its own token.
     confluence_api_token: str | None = None
+    # Writes are opt-in: enabled by listing projects. A separate write token is
+    # optional; without one the main token is used (it needs write scope then).
+    jira_write_api_token: str | None = None
+    jira_write_projects: frozenset[str] = frozenset()
 
     @property
     def confluence_token(self) -> str:
         return self.confluence_api_token or self.api_token
+
+    @property
+    def write_token(self) -> str:
+        return self.jira_write_api_token or self.api_token
+
+    @property
+    def writes_enabled(self) -> bool:
+        return bool(self.jira_write_projects)
+
+
+def _parse_projects(raw: str) -> frozenset[str]:
+    return frozenset(p.strip().upper() for p in raw.split(",") if p.strip())
 
 
 def _normalize_site_url(raw: str) -> str:
@@ -69,4 +85,6 @@ def load_settings() -> Settings:
         cloud_id=os.environ.get("ATLASSIAN_CLOUD_ID", "").strip() or None,
         env_file_found=env_file_found,
         confluence_api_token=os.environ.get("CONFLUENCE_API_TOKEN", "").strip() or None,
+        jira_write_api_token=os.environ.get("JIRA_WRITE_API_TOKEN", "").strip() or None,
+        jira_write_projects=_parse_projects(os.environ.get("JIRA_WRITE_PROJECTS", "")),
     )
