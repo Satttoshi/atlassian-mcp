@@ -92,6 +92,43 @@ class BaseUrlDetectionError(AtlassianError):
     """Neither candidate base URL authenticated successfully."""
 
 
+GRAPHQL_PATH = "/gateway/api/graphql"
+
+# The rich-text section of a release page exists only in Atlassian's GraphQL
+# gateway (experimental there, hence @optIn), not in the REST API.
+_SECTION = (
+    'richTextSection @optIn(to: "JiraVersionRichTextSection") '
+    "{ title content { json } }"
+)
+GRAPHQL_QUERIES: dict[str, str] = {
+    "VersionAri": (
+        "query VersionAri($cloudId: ID!, $projects: [String!]) { jira { "
+        "versionSearch(cloudId: $cloudId, filter: {projectKeys: $projects}, "
+        "first: 1) { edges { node { id } } } } }"
+    ),
+    "VersionSection": (
+        "query VersionSection($id: ID!) { jira { versionById(id: $id) "
+        f"{{ versionId {_SECTION} }} }} }}"
+    ),
+}
+GRAPHQL_MUTATIONS: dict[str, str] = {
+    "SetVersionSectionTitle": (
+        "mutation SetVersionSectionTitle("
+        "$input: JiraUpdateVersionRichTextSectionTitleInput!) { jira { "
+        "updateJiraVersionRichTextSectionTitle(input: $input) "
+        '@optIn(to: "JiraUpdateVersionRichTextSectionTitle") '
+        "{ success errors { message } } } }"
+    ),
+    "SetVersionSectionContent": (
+        "mutation SetVersionSectionContent("
+        "$input: JiraUpdateVersionRichTextSectionContentInput!) { jira { "
+        "updateJiraVersionRichTextSectionContent(input: $input) "
+        '@optIn(to: "JiraUpdateVersionRichTextSectionContent") '
+        "{ success errors { message } } } }"
+    ),
+}
+
+
 class AtlassianClient:
     def __init__(
         self,
@@ -113,6 +150,7 @@ class AtlassianClient:
             follow_redirects=True,
         )
         self._base_url: str | None = None
+        self._version_ari_prefix: str | None = None
         # Diagnostics for --check; filled in by _ensure_base_url().
         self.used_cloud_id_fallback: bool = False
         self.account: dict[str, Any] | None = None
@@ -144,6 +182,52 @@ class AtlassianClient:
         response = await self._request("GET", path, headers={"Accept": "*/*"})
         content_type = response.headers.get("content-type", "")
         return response.content, content_type.split(";")[0].strip()
+
+    async def graphql(self, operation: str, variables: dict[str, Any]) -> Any:
+        """Run one of the fixed GraphQL documents; returns its `jira` data."""
+        document = self._graphql_document(operation, variables)
+        response = await self._http.post(
+            f"{self.site_url}{GRAPHQL_PATH}",
+            json={"query": document, "variables": variables},
+        )
+        self._raise_for_status(response, GRAPHQL_PATH)
+        payload = response.json()
+        data = (payload.get("data") or {}).get("jira")
+        if data is None:
+            messages = "; ".join(
+                str(e.get("message")) for e in payload.get("errors") or []
+            )
+            raise AtlassianError(
+                f"{self.product.name} GraphQL {operation} failed: "
+                f"{messages or 'no data returned'}",
+                detail=response.text[:1000],
+            )
+        return data
+
+    def _graphql_document(self, operation: str, variables: dict[str, Any]) -> str:
+        if operation not in GRAPHQL_QUERIES:
+            raise ReadOnlyViolationError(
+                f"Blocked GraphQL {operation}: not an allowed read."
+            )
+        return GRAPHQL_QUERIES[operation]
+
+    async def version_ari(self, project: str, version_id: str) -> str:
+        """The GraphQL ID of a version; all versions of a site share its prefix."""
+        if self._version_ari_prefix is None:
+            cloud_id = self._settings.cloud_id or await self._fetch_cloud_id(
+                self.site_url
+            )
+            data = await self.graphql(
+                "VersionAri", {"cloudId": cloud_id, "projects": [project]}
+            )
+            edges = (data.get("versionSearch") or {}).get("edges") or []
+            if not edges:
+                raise AtlassianError(
+                    f"Could not determine the GraphQL ID of version {version_id} "
+                    f"in {project}: the version search returned nothing."
+                )
+            self._version_ari_prefix = str(edges[0]["node"]["id"]).rsplit("/", 1)[0]
+        return f"{self._version_ari_prefix}/{version_id}"
 
     # -- the single funnel -----------------------------------------------------
 
@@ -389,6 +473,7 @@ WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("DELETE", re.compile(r"^/rest/api/2/issueLink/\d+$")),
     ("POST", re.compile(r"^/rest/api/3/version$")),
     ("PUT", re.compile(r"^/rest/api/3/version/(?P<version>\d+)$")),
+    ("POST", re.compile(r"^/rest/api/3/version/(?P<version>\d+)/relatedwork$")),
 )
 
 # No name (rename), archived or moveUnfixedIssuesTo: a version can't be renamed
@@ -399,6 +484,7 @@ VERSION_CREATE_FIELDS = frozenset(
 VERSION_UPDATE_FIELDS = frozenset(
     {"released", "description", "startDate", "releaseDate", "driver"}
 )
+RELATED_WORK_FIELDS = frozenset({"category", "title", "url"})
 
 
 class WriteNotAllowedError(ReadOnlyViolationError):
@@ -417,6 +503,7 @@ class JiraWriteClient(AtlassianClient):
     the path has no issue key: callers must check the linked issues first.
     Version writes carry numeric IDs only, so they are allowed just for IDs
     this client looked up itself through project_id() and project_versions().
+    The same holds for the GraphQL mutations, which are a fixed set.
     """
 
     def __init__(
@@ -450,11 +537,7 @@ class JiraWriteClient(AtlassianClient):
 
     async def project_versions(self, project: str) -> list[dict[str, Any]]:
         """All versions of a project, in Jira's order (oldest first)."""
-        versions = list(
-            await self.get_json(
-                f"/rest/api/3/project/{project}/versions", params={"expand": "driver"}
-            )
-        )
+        versions = list(await self.get_json(f"/rest/api/3/project/{project}/versions"))
         for version in versions:
             self.track_version(str(version["id"]), project)
         return versions
@@ -493,7 +576,10 @@ class JiraWriteClient(AtlassianClient):
             self._require_known(
                 self._version_projects, match["version"], "version", path
             )
-            _require_fields(body, VERSION_UPDATE_FIELDS, path)
+            is_link = path.endswith("/relatedwork")
+            _require_fields(
+                body, RELATED_WORK_FIELDS if is_link else VERSION_UPDATE_FIELDS, path
+            )
         elif path == "/rest/api/3/version":
             self._require_known(
                 self._project_keys, str(body.get("projectId")), "project ID", path
@@ -501,6 +587,15 @@ class JiraWriteClient(AtlassianClient):
             _require_fields(body, VERSION_CREATE_FIELDS, path)
         for key in _body_issue_keys(path, body):
             self.require_project(key)
+
+    def _graphql_document(self, operation: str, variables: dict[str, Any]) -> str:
+        if operation not in GRAPHQL_MUTATIONS:
+            return super()._graphql_document(operation, variables)
+        ari = str((variables.get("input") or {}).get("id", ""))
+        self._require_known(
+            self._version_projects, ari.rsplit("/", 1)[-1], "version", GRAPHQL_PATH
+        )
+        return GRAPHQL_MUTATIONS[operation]
 
     def _require_known(
         self, known: dict[str, str], ref: str, what: str, path: str

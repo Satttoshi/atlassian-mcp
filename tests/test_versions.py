@@ -10,12 +10,20 @@ import pytest
 from fastmcp import FastMCP
 
 from jira_mcp import versions, writes
-from jira_mcp.client import JiraWriteClient, WriteNotAllowedError
+from jira_mcp.client import (
+    AtlassianError,
+    JiraClient,
+    JiraWriteClient,
+    ReadOnlyViolationError,
+    WriteNotAllowedError,
+)
 from jira_mcp.config import Settings, Site, _parse_projects
 
 SITE = "https://example.atlassian.net"
 PROJECT_IDS = {"OM": "100", "APP": "200", "EC": "300"}
 TODAY = date(2026, 11, 20)
+ARI = "ari:cloud:jira:cloud-1:version/activation/act-1"
+NOTES = "## Features\n- one ([OM-1](https://x.io/OM-1))\n- two\n\nDone."
 
 
 class FakeJira:
@@ -28,6 +36,9 @@ class FakeJira:
         self.permissions: dict[str, bool] = {}
         self.fail: dict[tuple[str, str], httpx.Response] = {}
         self.moved: dict[str, str] = {}
+        self.sections: dict[str, dict[str, Any]] = {}
+        self.related: dict[str, list[dict[str, Any]]] = {}
+        self.graphql_error: str | None = None
         self._next_id = 5000
 
     def add_version(self, project: str, name: str, **fields: Any) -> str:
@@ -58,6 +69,15 @@ class FakeJira:
             self.writes.append((method, path, body))
         if (method, path) in self.fail:
             return self.fail[(method, path)]
+        if path == "/_edge/tenant_info":
+            return httpx.Response(200, json={"cloudId": "cloud-1"})
+        if path == "/gateway/api/graphql":
+            return self._graphql(body)
+        if m := re.fullmatch(r"/rest/api/3/version/(\d+)/relatedwork", path):
+            entries = self.related.setdefault(m[1], [])
+            if method == "POST":
+                entries.append(body)
+            return httpx.Response(200, json=entries)
         if path == "/rest/api/3/myself":
             return httpx.Response(200, json={"accountId": "abc"})
         if path == "/rest/api/3/field":
@@ -83,7 +103,12 @@ class FakeJira:
         if m := re.fullmatch(r"/rest/api/3/project/(\w+)/versions", path):
             if m[1] not in PROJECT_IDS:
                 return httpx.Response(404)
-            return httpx.Response(200, json=self.of_project(m[1]))
+            # Like Jira: this endpoint never returns the driver.
+            plain = [
+                {k: v for k, v in version.items() if k != "driver"}
+                for version in self.of_project(m[1])
+            ]
+            return httpx.Response(200, json=plain)
         if m := re.fullmatch(r"/rest/api/3/project/(\w+)/version", path):
             return self._page(m[1], params)
         if path == "/rest/api/3/version" and method == "POST":
@@ -97,6 +122,8 @@ class FakeJira:
             return httpx.Response(
                 200, json={"issuesUnresolvedCount": 2, "issuesCount": 5}
             )
+        if (m := re.fullmatch(r"/rest/api/3/version/(\d+)", path)) and method == "GET":
+            return httpx.Response(200, json=self.versions[m[1]])
         if (m := re.fullmatch(r"/rest/api/3/version/(\d+)", path)) and method == "PUT":
             self.versions[m[1]].update(body)
             return httpx.Response(200, json=self.versions[m[1]])
@@ -120,6 +147,51 @@ class FakeJira:
                     self.fix[key].remove(op["remove"]["id"])
             return httpx.Response(204)
         return httpx.Response(404)
+
+    def _graphql(self, body: Any) -> httpx.Response:
+        if self.graphql_error:
+            return httpx.Response(
+                200, json={"data": None, "errors": [{"message": self.graphql_error}]}
+            )
+        query, variables = body["query"], body["variables"]
+        if "versionSearch" in query:
+            assert variables == {"cloudId": "cloud-1", "projects": ["OM"]}
+            node = {"id": f"{ARI}/1"}
+            return httpx.Response(
+                200,
+                json={"data": {"jira": {"versionSearch": {"edges": [{"node": node}]}}}},
+            )
+        if "mutation" in query:
+            assert '@optIn(to: "JiraUpdateVersionRichTextSection' in query
+        if "versionById" in query:
+            assert "@optIn" in query
+            version_id = variables["id"].removeprefix(f"{ARI}/")
+            section = self.sections.get(version_id, {})
+            data = {
+                "versionId": version_id,
+                "richTextSection": {
+                    "title": section.get("title"),
+                    "content": {"json": section.get("content")},
+                },
+            }
+            return httpx.Response(200, json={"data": {"jira": {"versionById": data}}})
+        payload = variables["input"]
+        version_id = payload.pop("id").removeprefix(f"{ARI}/")
+        self.sections.setdefault(version_id, {}).update(payload)
+        field = next(f for f in ("SectionTitle", "SectionContent") if f in query)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "jira": {
+                        f"updateJiraVersionRichText{field}": {
+                            "success": True,
+                            "errors": None,
+                        }
+                    }
+                }
+            },
+        )
 
     def _page(self, project: str, params: httpx.QueryParams) -> httpx.Response:
         found = list(reversed(self.of_project(project)))
@@ -396,6 +468,10 @@ async def test_driver_is_resolved_set_once_and_listed() -> None:
     listed = await versions.list_versions_impl(client, "OM")
     assert listed.count("driver: Ada Lovelace") == 2
     assert listed.count("driver: none") == 1
+    assert "- Driver: Ada Lovelace" in await versions.get_version_impl(
+        client, "OM", "v2"
+    )
+    assert "- Driver: none" in await versions.get_version_impl(client, "OM", "v3")
 
 
 # -- set_fix_version ----------------------------------------------------------------
@@ -512,6 +588,123 @@ async def test_set_fix_version_reports_version_create_failure_per_issue() -> Non
     )
 
 
+# -- release page: section and related work -----------------------------------------
+
+
+async def test_section_is_written_then_left_alone_then_replaced() -> None:
+    jira = FakeJira()
+    version_id = jira.add_version("OM", "v1")
+    client = make(jira)
+    out = await versions.set_version_section_impl(
+        client, "OM", "v1", "Release notes", NOTES
+    )
+    assert "Wrote the section of 'v1' in OM: title, content." in out
+    assert report("OM", version_id) in out
+    stored = jira.sections[version_id]
+    assert stored["title"] == "Release notes"
+    assert [node["type"] for node in stored["content"]["content"]] == [
+        "heading",
+        "bulletList",
+        "paragraph",
+    ]
+    graphql_writes = len(jira.writes)
+
+    kept = await versions.set_version_section_impl(client, "OM", "v1", "X", "other")
+    assert "Left the section of 'v1' in OM alone" in kept
+    assert "Existing title: Release notes" in kept
+    assert "> - one ([OM-1](https://x.io/OM-1))" in kept
+    assert jira.sections[version_id]["title"] == "Release notes"
+
+    same = await versions.set_version_section_impl(
+        client, "OM", "v1", "Release notes", NOTES, "replace"
+    )
+    assert "nothing changed" in same
+    # Reads are GraphQL POSTs too; only the first call sent the two mutations.
+    mutations = [b for _, _, b in jira.writes if "mutation" in b.get("query", "")]
+    assert len(mutations) == 2 and graphql_writes >= 2
+
+    replaced = await versions.set_version_section_impl(
+        client, "OM", "v1", content="new text", mode="replace"
+    )
+    assert "Wrote the section of 'v1' in OM: content." in replaced
+    assert jira.sections[version_id]["title"] == "Release notes"
+    shown = await versions.get_version_impl(client, "OM", "v1")
+    assert "**Section:** Release notes" in shown and "new text" in shown
+
+
+async def test_section_failures_are_plain_and_guarded() -> None:
+    jira = FakeJira()
+    version_id = jira.add_version("OM", "v1")
+    foreign = jira.add_version("EC", "v1")
+    client = make(jira)
+    with pytest.raises(ValueError, match="Nothing to write"):
+        await versions.set_version_section_impl(client, "OM", "v1")
+    with pytest.raises(ValueError, match="no version named"):
+        await versions.set_version_section_impl(client, "OM", "nope", "t")
+    with pytest.raises(WriteNotAllowedError, match="EC is not in"):
+        await versions.set_version_section_impl(client, "EC", "v1", "t")
+    mutation = {"input": {"id": f"{ARI}/{foreign}", "title": "t"}}
+    with pytest.raises(WriteNotAllowedError, match="not looked up"):
+        await client.graphql("SetVersionSectionTitle", mutation)
+    await client.project_versions("EC")
+    with pytest.raises(WriteNotAllowedError, match="EC is not in"):
+        await client.graphql("SetVersionSectionTitle", mutation)
+    with pytest.raises(ReadOnlyViolationError):
+        await client.graphql("DeleteEverything", {})
+    with pytest.raises(ReadOnlyViolationError):
+        await JiraClient(client._settings).graphql("SetVersionSectionTitle", mutation)
+
+    jira.graphql_error = "This API is not available with API tokens"
+    with pytest.raises(
+        AtlassianError,
+        match="can't be reached with this token.*"
+        "nothing was written, also not to the description.*"
+        "not available with API tokens",
+    ):
+        await versions.set_version_section_impl(client, "OM", "v1", "t", "c")
+    assert version_id not in jira.sections
+    shown = await versions.get_version_impl(client, "OM", "v1")
+    assert "**Section:** could not be read" in shown
+
+
+async def test_related_work_is_added_once() -> None:
+    jira = FakeJira()
+    version_id = jira.add_version("OM", "v1")
+    client = make(jira)
+    url = "https://github.com/acme/app/releases/tag/v1"
+    out = await versions.add_version_related_work_impl(
+        client, "OM", "v1", "GitHub Release", url
+    )
+    assert (
+        f"Added related work to 'v1' in OM: [Communication] GitHub Release: {url}."
+        in out
+    )
+    again = await versions.add_version_related_work_impl(
+        client, "OM", "v1", "Other title", url + "/", "Development"
+    )
+    assert "Already linked on 'v1' in OM, nothing changed" in again
+    assert jira.related[version_id] == [
+        {"category": "Communication", "title": "GitHub Release", "url": url}
+    ]
+    shown = await versions.get_version_impl(client, "OM", "v1")
+    assert f"- [Communication] GitHub Release: {url}" in shown
+    with pytest.raises(ValueError, match="http"):
+        await versions.add_version_related_work_impl(client, "OM", "v1", "t", "x.io")
+    with pytest.raises(WriteNotAllowedError, match="may not be set"):
+        await client.send(
+            "POST",
+            f"/rest/api/3/version/{version_id}/relatedwork",
+            {"category": "c", "title": "t", "url": url, "issueId": 1},
+        )
+
+
+async def test_list_versions_shows_first_description_line_only() -> None:
+    jira = FakeJira()
+    jira.add_version("OM", "v1", description="Short line\n\n- long\n- notes")
+    out = await versions.list_versions_impl(make(jira), "OM")
+    assert "  Short line …" in out and "- long" not in out
+
+
 # -- update_issue and registration --------------------------------------------------
 
 
@@ -547,7 +740,13 @@ async def test_register_adds_tools_and_instructions() -> None:
     writes.register(mcp, client_for, client.projects)
     versions.register(mcp, client_for, client.projects)
     tools = {tool.name: tool for tool in await mcp.list_tools()}
-    assert {"create_version", "update_version", "set_fix_version"} <= set(tools)
+    assert {
+        "create_version",
+        "update_version",
+        "set_fix_version",
+        "set_version_section",
+        "add_version_related_work",
+    } <= set(tools)
     assert all("site" in tool.parameters["properties"] for tool in tools.values())
     instructions = mcp.instructions or ""
     assert "enabled for Jira projects APP, OM only" in instructions

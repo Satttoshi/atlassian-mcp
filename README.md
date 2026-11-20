@@ -33,6 +33,7 @@ transitions, deletes, or comments on anything. Enforcement is layered:
 | `search_issues(jql, limit=25)` | Compact JQL search results |
 | `get_user_activity(from_date, to_date, user="me", include_confluence=False, max_issues=50)` | What a user did between two dates (`yyyy-MM-dd`, `to_date` exclusive): their comments (with mentions), status transitions, field edits and issue creations, grouped by issue and as one timeline, in the authenticated user's timezone. `user` is `"me"` or an accountId. Finds issues via `updatedBy(accountId, from, to)` JQL, then reads each issue's changelog and comments (5 in parallel). With `include_confluence`, also lists Confluence pages the user contributed to that were last modified in the range. Truncation and per-issue failures are reported in the output instead of failing the call |
 | `list_versions(project, query=None, status="all", limit=25)` | The release versions of a project, newest first: id, name, released, archived, start and release date, driver, description and the URL of the release report. `query` filters by name, `status` is `released`, `unreleased`, `archived` or `all` |
+| `get_version(project, name)` | One version in full: dates, driver, description, the rich-text section of its release page (title and text) and its related work links |
 | `get_attachment(attachment_id)` | Downloads an attachment (listed by `get_issue`). Images (png/jpeg/gif/webp) come back as vision input, so Claude can look at screenshots; text files (detected by mime type, or by extension when Jira reports `application/octet-stream`) come back as text. Files of unknown type and extension (e.g. `Dockerfile`, `app.log.1`) are downloaded and served as text if their content has no NUL bytes and is valid UTF-8 (or UTF-16 with BOM). Text over 20,000 characters is saved in full (as UTF-8) under `<tmp>/jira-mcp/attachments/`, and the tool returns that path plus the first and last 50 lines, so Claude can grep or page through the file instead of loading it all. Max 5 MB; videos, PDFs, archives and other binary files are rejected |
 
 ### Confluence
@@ -73,6 +74,8 @@ Then restart the MCP server (start a new Claude Code session). The startup log s
 | `unlink_issues(link_id)` | Link IDs show as `(link 12345)` in `get_issue_context` |
 | `create_version(project, name, description, start_date, release_date, driver)` | Create a release version; returns the existing one unchanged if the exact name is taken |
 | `update_version(project, name, released, release_date, start_date, description, driver)` | Change only the passed fields. `driver` (display name or email) assigns the release to a person. `released=true` without a date sets today on a version that has no release date. Reports the unresolved issue count; issues are never moved |
+| `set_version_section(project, name, title, content, mode)` | Write the rich-text section at the top of the release page (release notes). `content` is Markdown. Default `mode="only_if_empty"` leaves an existing section alone and returns it; `"replace"` overwrites |
+| `add_version_related_work(project, name, title, url, category)` | Add a link to the release page's "Related work"; a URL already there is reported as already linked |
 | `set_fix_version(issue_keys, version, action, create_missing)` | Add one version to (or remove it from) the Fix versions of up to 100 issues across projects, keeping their other versions. One result line per issue |
 
 Text is Jira wiki markup (REST v2), not Markdown.
@@ -88,6 +91,9 @@ The three version write tools use the same `JIRA_WRITE_PROJECTS` list as the oth
 - `update_issue` refuses Fix versions, because it would replace the whole list; use `set_fix_version`.
 - Permissions: creating and editing versions needs **Administer Projects** in that project, and a scoped token also needs `manage:jira-project`. Setting Fix versions needs **Resolve Issues** and the field on the issue's edit screen. A failing call names which one is missing where Jira lets us find out.
 - A version can't be deleted, archived or renamed through this server.
+- Release notes belong in the section (`set_version_section`), not in `description`: that is the short sidebar field, which Jira cuts off after a few lines. `list_versions` shows only its first line.
+- The section is not part of Jira's REST API. It is read and written through Atlassian's GraphQL gateway (`<site>/gateway/api/graphql`, experimental fields `JiraVersion.richTextSection`, `updateJiraVersionRichTextSectionTitle` and `...Content`), with the same email and API token. Only the fixed documents in `client.py` (`GRAPHQL_QUERIES`, `GRAPHQL_MUTATIONS`) can be sent, and a mutation only for a version in `JIRA_WRITE_PROJECTS`. If the gateway rejects the token, the tool says so and writes nothing; it never falls back to the description.
+- Section content is converted from Markdown to ADF (`markdown_adf.py`): headings, nested lists, bold, italic, code, fenced code, links. The wiki forms `h2. Heading` and `[label|url]` work too.
 
 With several sites configured, every write tool takes the same optional `site` argument as the read tools: issue keys and the project of `create_issue` are routed to the site that has the project, and `unlink_issues` needs `site` because a link ID does not identify a site. `JIRA_WRITE_PROJECTS` applies to every site.
 

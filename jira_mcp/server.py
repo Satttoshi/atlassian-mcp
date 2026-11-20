@@ -64,7 +64,8 @@ mcp: FastMCP = FastMCP(
         "linked Confluence pages worth reading. Use search_issues (JQL) when "
         "no key is given, get_user_activity for what someone did between "
         "two dates, and list_versions for the release versions of a project "
-        "(each with the URL of its release report). When a ticket lists attachments relevant to the "
+        "(each with the URL of its release report); get_version shows one "
+        "version with its release notes section and related work. When a ticket lists attachments relevant to the "
         "task (e.g. a screenshot on a UI bug, or a log, JSON payload, or CSV "
         "export), fetch them with get_attachment to read them.\n"
         "\n"
@@ -575,6 +576,28 @@ async def list_versions(
             await versions.list_versions_impl(
                 _get_client(target), key, query, status, limit
             ),
+        )
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def get_version(project: str, name: str, site: str | None = None) -> str:
+    """Show one release version in full: dates, driver, description, the
+    rich-text section of its release page (title and text, e.g. release
+    notes) and its related work links.
+
+    Args:
+        project: project key, e.g. "OM".
+        name: the exact version name, e.g. "mytrips-3.70.0".
+        site: Only with several configured sites: the site name. Optional
+            here, the project identifies the site.
+    """
+    try:
+        key = versions.normalize_project(project)
+        target = await _resolve_issue_site(site, f"{key}-0")
+        return _labelled(
+            target, await versions.get_version_impl(_get_client(target), key, name)
         )
     except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc

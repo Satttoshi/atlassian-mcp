@@ -19,6 +19,7 @@ from typing import Any, Literal
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from .adf import adf_to_markdown
 from .client import (
     AtlassianClient,
     AtlassianError,
@@ -27,6 +28,7 @@ from .client import (
     project_of,
 )
 from .config import ConfigError
+from .markdown_adf import markdown_to_adf
 from .render import normalize_issue_key
 from .writes import ClientFor, resolve_account_id
 
@@ -167,6 +169,17 @@ async def _driver_id(client: JiraWriteClient, project: str, driver: str) -> str:
     return account
 
 
+async def _with_driver(
+    client: AtlassianClient, version: dict[str, Any]
+) -> dict[str, Any]:
+    """The list of a project's versions never carries the driver; this does."""
+    return dict(
+        await client.get_json(
+            f"/rest/api/3/version/{version['id']}", params={"expand": "driver"}
+        )
+    )
+
+
 async def _driver_names(
     client: AtlassianClient, versions: list[dict[str, Any]]
 ) -> dict[str, str]:
@@ -203,8 +216,9 @@ def _render_version(
             f"driver: {drivers.get(str(v.get('driver')), 'none')}"
         )
     ]
-    if v.get("description"):
-        lines.append(f"  {v['description']}")
+    if description := str(v.get("description") or "").strip():
+        first, *rest = description.splitlines()
+        lines.append(f"  {first}{' …' if rest else ''}")
     lines.append(f"  {report_url(client, project, version_id)}")
     return "\n".join(lines)
 
@@ -353,6 +367,8 @@ async def update_version_impl(
             "existing ones; create_version creates one."
         )
     version_id = str(version["id"])
+    if driver:
+        version = await _with_driver(client, version)
     # Today only on the step to released, so a repeated call keeps the date.
     if released and release_date is None and not version.get("releaseDate"):
         release_date = (today or datetime.now().astimezone().date()).isoformat()
@@ -571,6 +587,220 @@ async def set_fix_version_impl(
     return "\n".join(lines)
 
 
+# -- release page: rich-text section and related work -------------------------------
+
+SectionMode = Literal["replace", "only_if_empty"]
+EXCERPT_LINES = 6
+
+
+async def read_section(
+    client: AtlassianClient, project: str, version_id: str
+) -> tuple[str, str, Any]:
+    """The section of a release page: (title, text as Markdown, raw ADF)."""
+    ari = await client.version_ari(project, version_id)
+    data = await client.graphql("VersionSection", {"id": ari})
+    version = data.get("versionById")
+    if version is None:
+        raise AtlassianError(
+            f"Jira's GraphQL API does not show version {version_id} of {project} "
+            "to this account."
+        )
+    section = version.get("richTextSection") or {}
+    adf = (section.get("content") or {}).get("json")
+    if isinstance(adf, str):
+        adf = json.loads(adf) if adf.strip() else None
+    return str(section.get("title") or ""), adf_to_markdown(adf).strip(), adf
+
+
+async def read_related_work(
+    client: AtlassianClient, version_id: str
+) -> list[dict[str, Any]]:
+    return list(await client.get_json(f"/rest/api/3/version/{version_id}/relatedwork"))
+
+
+def _excerpt(text: str) -> str:
+    lines = text.splitlines()
+    shown = lines[:EXCERPT_LINES] + (["…"] if len(lines) > EXCERPT_LINES else [])
+    return "\n".join(f"> {line}" for line in shown)
+
+
+def _section_block(title: str, text: str) -> list[str]:
+    if not title and not text:
+        return ["**Section:** empty"]
+    return [f"**Section:** {title or '(no title)'}", "", text or "(no text)"]
+
+
+async def get_version_impl(client: AtlassianClient, project: str, name: str) -> str:
+    project = normalize_project(project)
+    found = await client.get_json(f"/rest/api/3/project/{project}/versions")
+    version = _find(list(found), name)
+    if version is None:
+        raise ValueError(
+            f"{project} has no version named {name!r}. list_versions shows the "
+            "existing ones."
+        )
+    version_id = str(version["id"])
+    version = await _with_driver(client, version)
+    drivers = await _driver_names(client, [version])
+    lines = [
+        f"## {name} ({project}, id {version_id})",
+        "",
+        (
+            f"- Released: {_yes_no(version.get('released'))}, "
+            f"archived: {_yes_no(version.get('archived'))}"
+        ),
+        (
+            f"- Start: {version.get('startDate') or 'none'}, "
+            f"release: {version.get('releaseDate') or 'none'}"
+        ),
+        f"- Driver: {drivers.get(str(version.get('driver')), 'none')}",
+        f"- Description: {version.get('description') or 'none'}",
+        f"- {report_url(client, project, version_id)}",
+        "",
+    ]
+    try:
+        title, text, _ = await read_section(client, project, version_id)
+        lines += _section_block(title, text)
+    except AtlassianError as exc:
+        lines.append(f"**Section:** could not be read: {exc}")
+    lines.append("")
+    try:
+        related = await read_related_work(client, version_id)
+        lines.append(f"**Related work:** {'' if related else 'none'}".rstrip())
+        lines += [
+            f"- [{w.get('category')}] {w.get('title') or '(no title)'}: "
+            f"{w.get('url') or '(no URL)'}"
+            for w in related
+        ]
+    except AtlassianError as exc:
+        lines.append(f"**Related work:** could not be read: {exc}")
+    return "\n".join(lines)
+
+
+async def _existing_version(
+    client: JiraWriteClient, project: str, name: str
+) -> dict[str, Any]:
+    client.require_project(f"{project}-0")
+    version = _find(await client.project_versions(project), name)
+    if version is None:
+        raise ValueError(
+            f"{project} has no version named {name!r}. list_versions shows the "
+            "existing ones; create_version creates one."
+        )
+    return version
+
+
+async def _mutate_section(
+    client: JiraWriteClient, operation: str, field: str, payload: dict[str, Any]
+) -> None:
+    data = await client.graphql(operation, {"input": payload})
+    result = data.get(field) or {}
+    if not result.get("success"):
+        messages = "; ".join(str(e.get("message")) for e in result.get("errors") or [])
+        raise AtlassianError(
+            f"Jira did not save the section ({operation}): {messages or 'no reason given'}"
+        )
+
+
+async def set_version_section_impl(
+    client: JiraWriteClient,
+    project: str,
+    name: str,
+    title: str | None = None,
+    content: str | None = None,
+    mode: SectionMode = "only_if_empty",
+) -> str:
+    project = normalize_project(project)
+    if mode not in ("replace", "only_if_empty"):
+        raise ValueError("mode must be replace or only_if_empty.")
+    if title is None and content is None:
+        raise ValueError("Nothing to write: pass title, content or both.")
+    version = await _existing_version(client, project, name)
+    version_id = str(version["id"])
+    url = report_url(client, project, version_id)
+    try:
+        old_title, old_text, old_adf = await read_section(client, project, version_id)
+    except AtlassianError as exc:
+        raise AtlassianError(
+            f"The section of {name!r} can't be reached with this token "
+            f"({client.token_source}); nothing was written, also not to the "
+            f"description. {exc}"
+        ) from exc
+    if mode == "only_if_empty" and (old_title or old_text):
+        return (
+            f"Left the section of {name!r} in {project} alone: it is not empty "
+            'and mode is only_if_empty. Pass mode="replace" to overwrite it.\n\n'
+            f"Existing title: {old_title or '(none)'}\n"
+            f"{_excerpt(old_text) if old_text else '(no text)'}\n\n{url}"
+        )
+    ari = await client.version_ari(project, version_id)
+    written: list[str] = []
+    if title is not None and title != old_title:
+        await _mutate_section(
+            client,
+            "SetVersionSectionTitle",
+            "updateJiraVersionRichTextSectionTitle",
+            {"id": ari, "title": title},
+        )
+        written.append("title")
+    if content is not None:
+        adf = markdown_to_adf(content)
+        if adf != old_adf:
+            await _mutate_section(
+                client,
+                "SetVersionSectionContent",
+                "updateJiraVersionRichTextSectionContent",
+                {"id": ari, "content": adf},
+            )
+            written.append("content")
+    if not written:
+        return f"The section of {name!r} in {project} already has this, nothing changed. {url}"
+    return f"Wrote the section of {name!r} in {project}: {', '.join(written)}. {url}"
+
+
+async def add_version_related_work_impl(
+    client: JiraWriteClient,
+    project: str,
+    name: str,
+    title: str,
+    url: str,
+    category: str = "Communication",
+) -> str:
+    project = normalize_project(project)
+    url = url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"url must start with http:// or https://, got {url!r}.")
+    if not title.strip() or not category.strip():
+        raise ValueError("title and category must not be empty.")
+    version = await _existing_version(client, project, name)
+    version_id = str(version["id"])
+    page = report_url(client, project, version_id)
+    path = f"/rest/api/3/version/{version_id}/relatedwork"
+    existing = next(
+        (
+            w
+            for w in await read_related_work(client, version_id)
+            if str(w.get("url") or "").rstrip("/") == url.rstrip("/")
+        ),
+        None,
+    )
+    if existing is not None:
+        return (
+            f"Already linked on {name!r} in {project}, nothing changed: "
+            f"[{existing.get('category')}] {existing.get('title')}: {url}. {page}"
+        )
+    try:
+        await client.send(
+            "POST", path, {"category": category.strip(), "title": title, "url": url}
+        )
+    except AtlassianError as exc:
+        raise AtlassianError(
+            await explain_version_error(client, project, "edit", exc),
+            status_code=exc.status_code,
+        ) from exc
+    return f"Added related work to {name!r} in {project}: [{category.strip()}] {title}: {url}. {page}"
+
+
 # -- tool registration --------------------------------------------------------------
 
 
@@ -597,7 +827,9 @@ def register(mcp: FastMCP, client_for: ClientFor, projects: frozenset[str]) -> N
         Args:
             project: project key, e.g. "OM".
             name: the exact version name, e.g. "mytrips-3.70.0". Never altered.
-            description: plain text.
+            description: a short plain text for the sidebar; Jira cuts it
+                off after a few lines. Release notes belong in
+                set_version_section.
             start_date: YYYY-MM-DD.
             release_date: the planned release day, YYYY-MM-DD.
             driver: the person responsible for the release: display name or
@@ -641,7 +873,9 @@ def register(mcp: FastMCP, client_for: ClientFor, projects: frozenset[str]) -> N
             release_date: YYYY-MM-DD. With released=true and no date, a version
                 that has no release date yet gets today.
             start_date: YYYY-MM-DD.
-            description: plain text; replaces the old one.
+            description: a short plain text for the sidebar (Jira cuts it
+                off after a few lines); replaces the old one. Release notes
+                belong in set_version_section.
             driver: the person responsible for the release: display name or
                 email of a user of that project. Can be changed, not removed.
             site: Only with several configured sites: the site name. Optional
@@ -699,10 +933,78 @@ def register(mcp: FastMCP, client_for: ClientFor, projects: frozenset[str]) -> N
         except errors as exc:
             raise ToolError(str(exc)) from exc
 
+    @mcp.tool
+    async def set_version_section(
+        project: str,
+        name: str,
+        title: str | None = None,
+        content: str | None = None,
+        mode: SectionMode = "only_if_empty",
+        site: str | None = None,
+    ) -> str:
+        """Write the rich-text section at the top of a release page: the place
+        for release notes. By default a section that already has a title or
+        text is left alone and its current content returned, since a release
+        manager may have written it by hand.
+
+        Args:
+            project: project key, e.g. "OM".
+            name: the exact name of an existing version.
+            title: the section title, e.g. "Release notes".
+            content: the body as Markdown (unlike the issue tools): headings,
+                nested bullet and numbered lists, **bold**, *italic*, `code`,
+                fenced code blocks, [label](url) links and bare URLs. Also
+                accepted: "h2. Heading" and "[label|url]".
+            mode: "only_if_empty" (default) or "replace". With "replace", read
+                the section with get_version first.
+            site: Only with several configured sites: the site name. Optional
+                here, the project identifies the site.
+        """
+        try:
+            return await set_version_section_impl(
+                await for_project(site, project), project, name, title, content, mode
+            )
+        except errors as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool
+    async def add_version_related_work(
+        project: str,
+        name: str,
+        title: str,
+        url: str,
+        category: str = "Communication",
+        site: str | None = None,
+    ) -> str:
+        """Add a link to the "Related work" list of a release page, e.g. the
+        GitHub release, the changelog or the release PR. Safe to repeat: a URL
+        that is already on the version is reported as already linked.
+
+        Args:
+            project: project key, e.g. "OM".
+            name: the exact name of an existing version.
+            title: the link text, e.g. "GitHub Release".
+            url: the link target.
+            category: Jira groups the links by it. Free text; Jira's own ones
+                are Communication, Design, Development, Documentation,
+                Testing and Other.
+            site: Only with several configured sites: the site name. Optional
+                here, the project identifies the site.
+        """
+        try:
+            return await add_version_related_work_impl(
+                await for_project(site, project), project, name, title, url, category
+            )
+        except errors as exc:
+            raise ToolError(str(exc)) from exc
+
     mcp.instructions = (mcp.instructions or "").replace(
         "unlink_issues). Nothing can be deleted",
         "unlink_issues, and the release tools create_version, update_version, "
-        "set_fix_version). Releases: a version belongs to one project, so a "
+        "set_fix_version, set_version_section, add_version_related_work). "
+        "Release notes go into the section of the release page "
+        "(set_version_section, Markdown), links into its related work; a "
+        "version's description is only a short sidebar text. Releases: a version belongs to one project, so a "
         "release spanning projects needs the same version name in each; "
         "set_fix_version handles that per issue, and list_versions shows what "
         "exists. Pass version names exactly as given. Nothing can be deleted",
