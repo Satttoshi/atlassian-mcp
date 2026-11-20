@@ -17,7 +17,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
 
-from . import activity, confluence, writes
+from . import activity, confluence, versions, writes
 from .attachments import AttachmentMeta, read_attachment
 from .client import (
     AtlassianClient,
@@ -62,8 +62,9 @@ mcp: FastMCP = FastMCP(
         "Jira workflow: start with get_issue for the full ticket, then "
         "get_issue_context to find parents, subtasks, linked issues, and "
         "linked Confluence pages worth reading. Use search_issues (JQL) when "
-        "no key is given, and get_user_activity for what someone did between "
-        "two dates. When a ticket lists attachments relevant to the "
+        "no key is given, get_user_activity for what someone did between "
+        "two dates, and list_versions for the release versions of a project "
+        "(each with the URL of its release report). When a ticket lists attachments relevant to the "
         "task (e.g. a screenshot on a UI bug, or a log, JSON payload, or CSV "
         "export), fetch them with get_attachment to read them.\n"
         "\n"
@@ -545,6 +546,41 @@ async def search_issues(jql: str, limit: int = 25, site: str | None = None) -> s
 
 
 @mcp.tool
+async def list_versions(
+    project: str,
+    query: str | None = None,
+    status: versions.Status = "all",
+    limit: int = 25,
+    site: str | None = None,
+) -> str:
+    """List the release versions of one Jira project, newest first.
+
+    Each version shows id, name, released, archived, start and release date,
+    description, and the URL of its release report (the issues that carry the
+    version in Fix versions).
+
+    Args:
+        project: project key, e.g. "OM".
+        query: only versions whose name contains this text, e.g. "mytrips-".
+        status: "released", "unreleased", "archived" or "all".
+        limit: Maximum number of versions to return (1-100).
+        site: Only with several configured sites: the site name. Optional
+            here, the project identifies the site.
+    """
+    try:
+        key = versions.normalize_project(project)
+        target = await _resolve_issue_site(site, f"{key}-0")
+        return _labelled(
+            target,
+            await versions.list_versions_impl(
+                _get_client(target), key, query, status, limit
+            ),
+        )
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
 async def get_user_activity(
     from_date: str,
     to_date: str,
@@ -903,6 +939,7 @@ def _register_writes() -> None:
             logger.warning("Jira writes stay disabled: JIRA_WRITE_PROJECTS is not set.")
         return
     writes.register(mcp, _write_client_for, settings.jira_write_projects)
+    versions.register(mcp, _write_client_for, settings.jira_write_projects)
     logger.info(
         "Jira writes enabled for projects: %s",
         ", ".join(sorted(settings.jira_write_projects)),

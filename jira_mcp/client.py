@@ -79,9 +79,13 @@ class ReadOnlyViolationError(RuntimeError):
 class AtlassianError(Exception):
     """An API call failed; the message is written to be actionable."""
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
+    def __init__(
+        self, message: str, status_code: int | None = None, detail: str = ""
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        # The raw response body, for callers that explain an error further.
+        self.detail = detail
 
 
 class BaseUrlDetectionError(AtlassianError):
@@ -324,7 +328,7 @@ class AtlassianClient:
             message = f"429 Too Many Requests: {name} is rate-limiting; retry shortly."
         else:
             message = f"{name} returned HTTP {status} for {path}: {response.text[:300]}"
-        raise AtlassianError(message, status_code=status)
+        raise AtlassianError(message, status_code=status, detail=response.text[:1000])
 
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
@@ -363,7 +367,10 @@ JIRA_WRITE = Product(
     name="Jira (write)",
     gateway="jira",
     probe_path=MYSELF_PATH,
-    scopes="read:jira-work, write:jira-work and read:jira-user",
+    scopes=(
+        "read:jira-work, write:jira-work and read:jira-user (plus "
+        "manage:jira-project for the version tools)"
+    ),
     not_found_hint="Jira reports issues you cannot view as 404",
     allowed_post_paths=frozenset({"/rest/api/3/search/jql"}),
 )
@@ -380,6 +387,17 @@ WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(rf"^/rest/api/2/issue/{_KEY}/transitions$")),
     ("POST", re.compile(r"^/rest/api/2/issueLink$")),
     ("DELETE", re.compile(r"^/rest/api/2/issueLink/\d+$")),
+    ("POST", re.compile(r"^/rest/api/3/version$")),
+    ("PUT", re.compile(r"^/rest/api/3/version/(?P<version>\d+)$")),
+)
+
+# No name (rename), archived or moveUnfixedIssuesTo: a version can't be renamed
+# or archived, and releasing one never moves its issues.
+VERSION_CREATE_FIELDS = frozenset(
+    {"name", "projectId", "description", "startDate", "releaseDate", "driver"}
+)
+VERSION_UPDATE_FIELDS = frozenset(
+    {"released", "description", "startDate", "releaseDate", "driver"}
 )
 
 
@@ -397,6 +415,8 @@ class JiraWriteClient(AtlassianClient):
     Every write is checked against WRITE_ROUTES and JIRA_WRITE_PROJECTS before
     it is sent. Removing a link (DELETE issueLink) can't be checked here, since
     the path has no issue key: callers must check the linked issues first.
+    Version writes carry numeric IDs only, so they are allowed just for IDs
+    this client looked up itself through project_id() and project_versions().
     """
 
     def __init__(
@@ -411,6 +431,8 @@ class JiraWriteClient(AtlassianClient):
             )
         super().__init__(settings, JIRA_WRITE, settings.write_token, http, site)
         self.projects = settings.jira_write_projects
+        self._project_keys: dict[str, str] = {}
+        self._version_projects: dict[str, str] = {}
 
     def require_project(self, issue_key: str) -> None:
         project = project_of(issue_key)
@@ -419,6 +441,26 @@ class JiraWriteClient(AtlassianClient):
                 f"Blocked write to {issue_key}: project {project} is not in "
                 f"JIRA_WRITE_PROJECTS ({', '.join(sorted(self.projects))})."
             )
+
+    async def project_id(self, project: str) -> str:
+        data = await self.get_json(f"/rest/api/3/project/{project}")
+        project_id = str(data["id"])
+        self._project_keys[project_id] = project
+        return project_id
+
+    async def project_versions(self, project: str) -> list[dict[str, Any]]:
+        """All versions of a project, in Jira's order (oldest first)."""
+        versions = list(
+            await self.get_json(
+                f"/rest/api/3/project/{project}/versions", params={"expand": "driver"}
+            )
+        )
+        for version in versions:
+            self.track_version(str(version["id"]), project)
+        return versions
+
+    def track_version(self, version_id: str, project: str) -> None:
+        self._version_projects[version_id] = project
 
     async def send(
         self, method: str, path: str, json_body: dict[str, Any] | None = None
@@ -443,10 +485,41 @@ class JiraWriteClient(AtlassianClient):
             raise WriteNotAllowedError(
                 f"Blocked {method} {path}: not an allowed write."
             )
-        if "key" in match.groupdict():
+        body = json_body or {}
+        groups = match.groupdict()
+        if "key" in groups:
             self.require_project(match["key"])
-        for key in _body_issue_keys(path, json_body or {}):
+        if "version" in groups:
+            self._require_known(
+                self._version_projects, match["version"], "version", path
+            )
+            _require_fields(body, VERSION_UPDATE_FIELDS, path)
+        elif path == "/rest/api/3/version":
+            self._require_known(
+                self._project_keys, str(body.get("projectId")), "project ID", path
+            )
+            _require_fields(body, VERSION_CREATE_FIELDS, path)
+        for key in _body_issue_keys(path, body):
             self.require_project(key)
+
+    def _require_known(
+        self, known: dict[str, str], ref: str, what: str, path: str
+    ) -> None:
+        project = known.get(ref)
+        if project is None:
+            raise WriteNotAllowedError(
+                f"Blocked write to {path}: {what} {ref} was not looked up first, "
+                "so its project is unknown."
+            )
+        self.require_project(f"{project}-0")
+
+
+def _require_fields(body: dict[str, Any], allowed: frozenset[str], path: str) -> None:
+    extra = sorted(set(body) - allowed)
+    if extra:
+        raise WriteNotAllowedError(
+            f"Blocked write to {path}: field(s) {', '.join(extra)} may not be set."
+        )
 
 
 def _body_issue_keys(path: str, body: dict[str, Any]) -> list[str]:

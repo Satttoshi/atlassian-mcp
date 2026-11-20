@@ -120,6 +120,11 @@ async def update_issue_impl(
     key = normalize_issue_key(issue_key)
     client.require_project(key)
     body: dict[str, Any] = await resolve_fields(client, fields or {})
+    if "fixVersions" in body:
+        raise ValueError(
+            "Fix versions can't be set through update_issue: it would replace "
+            "the whole list. Use set_fix_version to add or remove one version."
+        )
     if summary is not None:
         body["summary"] = summary
     if description is not None:
@@ -339,7 +344,8 @@ def register(mcp: FastMCP, client_for: ClientFor, projects: frozenset[str]) -> N
             labels: the full new label list (replaces the old one).
             fields: other fields by display name or ID, e.g.
                 {"Acceptance Criteria": "...", "Epic Link": "AC-38",
-                "Story Points": 3}. Rich-text fields take wiki markup.
+                "Story Points": 3}. Rich-text fields take wiki markup. Fix
+                versions are not supported here, use set_fix_version.
             site: Only with several configured sites: the site name. Optional
                 here, the issue key's project identifies the site.
 

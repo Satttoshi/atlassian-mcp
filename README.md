@@ -32,6 +32,7 @@ transitions, deletes, or comments on anything. Enforcement is layered:
 | `get_issue_context(issue_key)` | Parent, subtasks, linked issues (with link direction), epic children, and remote links. Linked Confluence pages are shown with their page ID, ready for `get_confluence_page` |
 | `search_issues(jql, limit=25)` | Compact JQL search results |
 | `get_user_activity(from_date, to_date, user="me", include_confluence=False, max_issues=50)` | What a user did between two dates (`yyyy-MM-dd`, `to_date` exclusive): their comments (with mentions), status transitions, field edits and issue creations, grouped by issue and as one timeline, in the authenticated user's timezone. `user` is `"me"` or an accountId. Finds issues via `updatedBy(accountId, from, to)` JQL, then reads each issue's changelog and comments (5 in parallel). With `include_confluence`, also lists Confluence pages the user contributed to that were last modified in the range. Truncation and per-issue failures are reported in the output instead of failing the call |
+| `list_versions(project, query=None, status="all", limit=25)` | The release versions of a project, newest first: id, name, released, archived, start and release date, driver, description and the URL of the release report. `query` filters by name, `status` is `released`, `unreleased`, `archived` or `all` |
 | `get_attachment(attachment_id)` | Downloads an attachment (listed by `get_issue`). Images (png/jpeg/gif/webp) come back as vision input, so Claude can look at screenshots; text files (detected by mime type, or by extension when Jira reports `application/octet-stream`) come back as text. Files of unknown type and extension (e.g. `Dockerfile`, `app.log.1`) are downloaded and served as text if their content has no NUL bytes and is valid UTF-8 (or UTF-16 with BOM). Text over 20,000 characters is saved in full (as UTF-8) under `<tmp>/jira-mcp/attachments/`, and the tool returns that path plus the first and last 50 lines, so Claude can grep or page through the file instead of loading it all. Max 5 MB; videos, PDFs, archives and other binary files are rejected |
 
 ### Confluence
@@ -58,7 +59,7 @@ Every tool except `whoami` also takes an optional `site` argument; see
 Off by default. To turn them on, set in `.env`:
 
 - `JIRA_WRITE_PROJECTS`: comma-separated project keys the write tools may touch, e.g. `AC`. Required.
-- `JIRA_WRITE_API_TOKEN`: optional. Without it the writes use the Jira token (`JIRA_API_TOKEN`, else `ATLASSIAN_API_TOKEN`), which then needs `write:jira-work` (an unscoped token has it). Set a separate token with `read:jira-work`, `write:jira-work` and `read:jira-user` to keep the read token read-only.
+- `JIRA_WRITE_API_TOKEN`: optional. Without it the writes use the Jira token (`JIRA_API_TOKEN`, else `ATLASSIAN_API_TOKEN`), which then needs `write:jira-work` (an unscoped token has it). Set a separate token with `read:jira-work`, `write:jira-work` and `read:jira-user` to keep the read token read-only. Add `manage:jira-project` if the version tools should create or edit versions.
 
 Then restart the MCP server (start a new Claude Code session). The startup log says "Jira writes enabled for projects: …".
 
@@ -70,15 +71,30 @@ Then restart the MCP server (start a new Claude Code session). The startup log s
 | `transition_issue(issue_key, status)` | Move to a status; the error lists the possible ones |
 | `link_issues(issue_key, relation, other_key)` | e.g. `("AC-66", "is blocked by", "AC-14")`; the link is read back to check its direction |
 | `unlink_issues(link_id)` | Link IDs show as `(link 12345)` in `get_issue_context` |
+| `create_version(project, name, description, start_date, release_date, driver)` | Create a release version; returns the existing one unchanged if the exact name is taken |
+| `update_version(project, name, released, release_date, start_date, description, driver)` | Change only the passed fields. `driver` (display name or email) assigns the release to a person. `released=true` without a date sets today on a version that has no release date. Reports the unresolved issue count; issues are never moved |
+| `set_fix_version(issue_keys, version, action, create_missing)` | Add one version to (or remove it from) the Fix versions of up to 100 issues across projects, keeping their other versions. One result line per issue |
 
 Text is Jira wiki markup (REST v2), not Markdown.
+
+### Release versions
+
+`list_versions(project, query, status, limit)` is read-only and always available. It lists a project's versions newest first, each with the URL of its release report (the issues that carry the version in Fix versions).
+
+The three version write tools use the same `JIRA_WRITE_PROJECTS` list as the other writes. They take version names, never IDs, never alter a name, and are safe to repeat: the second identical call changes nothing.
+
+- A version belongs to one project. For a release that spans projects, `set_fix_version` gives each issue the version of that name in its own project; with `create_missing=true` it creates the version where it is missing.
+- `set_fix_version` reports each issue as `added`, `removed`, `unchanged`, `skipped` or `failed` with the reason. Issues in projects outside `JIRA_WRITE_PROJECTS`, an archived version and an unknown issue key affect only their own line.
+- `update_issue` refuses Fix versions, because it would replace the whole list; use `set_fix_version`.
+- Permissions: creating and editing versions needs **Administer Projects** in that project, and a scoped token also needs `manage:jira-project`. Setting Fix versions needs **Resolve Issues** and the field on the issue's edit screen. A failing call names which one is missing where Jira lets us find out.
+- A version can't be deleted, archived or renamed through this server.
 
 With several sites configured, every write tool takes the same optional `site` argument as the read tools: issue keys and the project of `create_issue` are routed to the site that has the project, and `unlink_issues` needs `site` because a link ID does not identify a site. `JIRA_WRITE_PROJECTS` applies to every site.
 
 Guard rails, all in `JiraWriteClient` (`client.py`):
 
-1. Only the routes in `WRITE_ROUTES` are allowed. Nothing can be deleted except an issue link; issues, comments and attachments can't.
-2. Every write is checked against `JIRA_WRITE_PROJECTS`, including the project in a create and both issues of a link.
+1. Only the routes in `WRITE_ROUTES` are allowed. Nothing can be deleted except an issue link; issues, comments, attachments and versions can't.
+2. Every write is checked against `JIRA_WRITE_PROJECTS`, including the project in a create and both issues of a link. Version writes carry only numeric IDs, so they are allowed just for projects and versions the client looked up itself, and only with the fields listed in `VERSION_CREATE_FIELDS` and `VERSION_UPDATE_FIELDS`.
 3. The read client (`JiraClient`) is unchanged and still blocks every write. Confluence stays read-only.
 4. Claude Code asks before each tool call unless you allow the tool in your permissions.
 
